@@ -243,7 +243,7 @@ if __name__ == "__main__":
             <h3 style="text-align:center; color:#333; margin-top:20px;">🌍 全球核心资产情绪监控</h3>
             {html_body}
             <div style="text-align:center; font-size:12px; color:#aaa; margin-bottom:20px;">
-                策略提示：绿色分批定投，红色分批止盈
+                策略提示：＜25开始分批定投，大于75开始分批止盈，30个交易日内大于75的天数超过10天建议止盈
             </div>
         </div>
     </body>
