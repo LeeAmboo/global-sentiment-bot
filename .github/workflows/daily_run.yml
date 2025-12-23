@@ -2,8 +2,8 @@ name: Global Sentiment Monitor
 
 on:
   schedule:
-    # 每天 UTC 0:45 运行 (即北京时间早上 8:45)
-    - cron: '45 0 * * *'
+    # 每天 UTC 3:45 运行 (即北京时间早上 11:45)
+    - cron: '45 3 * * *'
   workflow_dispatch: # 允许手动点击运行测试
 
 jobs:
