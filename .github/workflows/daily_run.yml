@@ -2,9 +2,13 @@ name: Global Sentiment Monitor
 
 on:
   schedule:
-    # 每天 UTC 3:45 运行 (即北京时间早上 11:45)
-    - cron: '45 3 * * *'
-  workflow_dispatch: # 允许手动点击运行测试
+    # 建议设置在未来的 1-2 小时后，给它足够的时间生效
+    # 例如：北京时间 11:30 (UTC 03:30)
+    - cron: '30 3 * * *'
+  workflow_dispatch: # 允许手动点击
+  push:              # 【新增】每次提交代码自动运行一次，用来测试
+    branches:
+      - main
 
 jobs:
   build:
