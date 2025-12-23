@@ -2,11 +2,12 @@ import requests
 import os
 import yfinance as yf
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 # ================= 配置区域 =================
 CNN_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
-CRYPTO_URL = "https://api.alternative.me/fng/?limit=80"
+# CoinGlass 接口 (使用 FAPI 端点，通常无需 Key 即可访问)
+COINGLASS_URL = "https://fapi.coinglass.com/api/index/fear-greed-history"
 ASHARE_CODE = "000300.SS"
 # 韭圈儿链接
 JIUQUAN_URL = "https://funddb.cn/tool/fear"
@@ -52,33 +53,55 @@ def get_us_data():
     """获取美股数据 (优先CNN, 失败切RSI)"""
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Referer": "https://www.cnn.com/",
             "Origin": "https://www.cnn.com"
         }
-        res = requests.get(CNN_URL, headers=headers, timeout=10)
+        res = requests.get(CNN_URL, headers=headers, timeout=15)
         data = res.json()["fear_and_greed_historical"]["data"]
+        # CNN数据是时间戳，需要排序
         data.sort(key=lambda x: x["x"], reverse=True)
         formatted = [{
             "date": datetime.fromtimestamp(d["x"] / 1000).strftime("%Y-%m-%d"),
             "value": int(d["y"])
         } for d in data]
         return formatted, "CNN 官方数据"
-    except:
-        print("Switching to S&P 500 RSI...")
+    except Exception as e:
+        print(f"CNN data failed ({e}), Switching to S&P 500 RSI...")
         rsi = calculate_rsi_history("^GSPC")
         return rsi, "S&P 500 RSI (替代)"
 
 def get_crypto_data():
-    """获取加密货币数据"""
+    """获取加密货币数据 (CoinGlass)"""
     try:
-        res = requests.get(CRYPTO_URL, timeout=10)
-        data = res.json()["data"]
-        return [{
-            "date": datetime.fromtimestamp(int(d["timestamp"])).strftime("%Y-%m-%d"),
-            "value": int(d["value"])
-        } for d in data], "Alternative.me"
-    except:
+        # CoinGlass 需要伪装 User-Agent
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Origin": "https://www.coinglass.com",
+            "Referer": "https://www.coinglass.com/"
+        }
+        res = requests.get(COINGLASS_URL, headers=headers, timeout=15)
+        res_json = res.json()
+        
+        if res_json["code"] != "0":
+            raise Exception(f"CoinGlass API Error: {res_json.get('msg')}")
+
+        data = res_json["data"]
+        # CoinGlass 数据通常是时间戳升序，我们需要降序(最新的在前)
+        # 字段通常是: time (ms), values (int)
+        data.sort(key=lambda x: x["time"], reverse=True)
+        
+        formatted = []
+        for d in data[:80]: # 取最近80条
+            formatted.append({
+                # CoinGlass 时间戳是毫秒
+                "date": datetime.fromtimestamp(d["time"] / 1000).strftime("%Y-%m-%d"),
+                "value": int(d["values"]) 
+            })
+            
+        return formatted, "CoinGlass"
+    except Exception as e:
+        print(f"CoinGlass Error: {e}")
         return None, "获取失败"
 
 def get_cn_data():
@@ -188,7 +211,6 @@ def generate_card_html(name, source, stats, link=None):
 # ================= 推送发送 =================
 def send_push(title, content):
     token = os.getenv("PUSHPLUS_TOKEN")
-    # 【关键修改】获取群组编码
     topic = os.getenv("PUSHPLUS_TOPIC") 
     
     if not token: 
@@ -201,10 +223,9 @@ def send_push(title, content):
         "title": title,
         "content": content,
         "template": "html",
-        "topic": topic  # 【关键修改】必须包含此字段，群组推送才能生效
+        "topic": topic
     }
     
-    # 打印一下，确保我们知道发给了哪个群组
     print(f"📡 准备推送到群组: {topic if topic else '无 (单人推送)'}")
     
     try:
@@ -223,7 +244,7 @@ if __name__ == "__main__":
     # 定义任务列表
     tasks = [
         ("🇺🇸 美股", get_us_data, None),
-        ("₿ 比特币", get_crypto_data, None),
+        ("₿ CoinGlass", get_crypto_data, None), # 显示为 CoinGlass
         ("🇨🇳 A股", get_cn_data, JIUQUAN_URL)
     ]
 
@@ -236,9 +257,14 @@ if __name__ == "__main__":
         # 生成卡片 HTML
         html_cards += generate_card_html(name, source_name, stats, link)
         
-        # 如果成功获取，添加到标题
+        # 修正标题生成逻辑：使用国旗代替文字
         if stats:
-            parts.append(f"{name.split(' ')[1]}:{stats['val']}")
+            flag_icon = name.split(' ')[0]
+            parts.append(f"{flag_icon}:{stats['val']}")
+
+    # 获取当前北京时间 (UTC+8)
+    beijing_time = datetime.now(timezone(timedelta(hours=8)))
+    formatted_time = beijing_time.strftime('%Y-%m-%d %H:%M')
 
     # 生成策略提示脚部 (Footer)
     strategy_footer = f"""
@@ -250,7 +276,7 @@ if __name__ == "__main__":
             <li><span style="background:#fff3cd; padding:2px 4px; border-radius:2px;">⚠️ <b>高危信号</b></span>：若近30个交易日内，大于{LIMIT_HIGH}的天数超过 <b>{DANGER_DAYS_THRESHOLD}天</b>，建议大幅减仓止盈。</li>
         </ul>
         <div style="margin-top:8px; text-align:right; font-size:11px; color:#999;">
-            Data Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+            Data Updated: {formatted_time} (Beijing Time)
         </div>
     </div>
     """
@@ -269,7 +295,7 @@ if __name__ == "__main__":
     """
 
     if parts:
-        today_str = datetime.now().strftime("%m-%d")
+        today_str = beijing_time.strftime("%m-%d")
         title = f"{today_str} | " + " | ".join(parts)
         send_push(title, full_html)
     else:
