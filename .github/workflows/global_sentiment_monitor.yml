@@ -1,9 +1,9 @@
 name: Global Sentiment Monitor
 
 on:
-  # 1. 定时触发：北京时间 12:30 (UTC 04:30)
+  # 1. 定时触发：北京时间 13:30 (UTC 05:30)
   schedule:
-    - cron: '30 4 * * *'
+    - cron: '30 5 * * *'
   # 2. 手动触发：允许点击 Run workflow
   workflow_dispatch:
 
