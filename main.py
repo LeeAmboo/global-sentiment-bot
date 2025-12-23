@@ -188,6 +188,9 @@ def generate_card_html(name, source, stats, link=None):
 # ================= 推送发送 =================
 def send_push(title, content):
     token = os.getenv("PUSHPLUS_TOKEN")
+    # 【关键修改】获取群组编码
+    topic = os.getenv("PUSHPLUS_TOPIC") 
+    
     if not token: 
         print("❌ 未检测到 Token，跳过推送")
         return
@@ -197,11 +200,16 @@ def send_push(title, content):
         "token": token,
         "title": title,
         "content": content,
-        "template": "html"
+        "template": "html",
+        "topic": topic  # 【关键修改】必须包含此字段，群组推送才能生效
     }
+    
+    # 打印一下，确保我们知道发给了哪个群组
+    print(f"📡 准备推送到群组: {topic if topic else '无 (单人推送)'}")
+    
     try:
         requests.post(url, json=data, timeout=10)
-        print("✅ 推送已发送")
+        print("✅ 推送请求已发送")
     except Exception as e:
         print(f"❌ 推送发送失败: {e}")
 
