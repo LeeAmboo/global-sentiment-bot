@@ -15,6 +15,10 @@ LIMIT_HIGH = 75
 DANGER_DAYS_THRESHOLD = 10
 MAX_PUSHPLUS_LEN = 19000        # PushPlus 限制约 2 万字，留一点余量
 
+FEAR_COLOR = "#16a34a"          # 恐慌：绿色
+GREED_COLOR = "#dc2626"         # 贪婪：红色
+NEUTRAL_COLOR = "#555555"       # 中性：深灰
+
 
 # ================= 通用工具 =================
 def safe(x):
@@ -31,10 +35,28 @@ def status_text(value):
 
 def value_color(value):
     if value < LIMIT_LOW:
-        return "#16a34a"       # 绿色：恐慌机会区
+        return FEAR_COLOR       # 绿色：恐慌机会区
     if value > LIMIT_HIGH:
-        return "#dc2626"       # 红色：贪婪风险区
+        return GREED_COLOR       # 红色：贪婪风险区
     return "#333333"
+
+
+def status_class(value):
+    """用于 HTML 高亮：恐慌绿色，贪婪红色，中性普通。"""
+    if value < LIMIT_LOW:
+        return "fear"
+    if value > LIMIT_HIGH:
+        return "greed"
+    return "neutral"
+
+
+def status_style(value):
+    """关键字段使用内联样式，避免部分微信/HTML 渲染环境忽略 class。"""
+    if value < LIMIT_LOW:
+        return f"color:{FEAR_COLOR};font-weight:800"
+    if value > LIMIT_HIGH:
+        return f"color:{GREED_COLOR};font-weight:800"
+    return f"color:{NEUTRAL_COLOR};font-weight:600"
 
 
 def dedupe_by_date(data):
@@ -227,8 +249,8 @@ def make_svg_chart(history):
       <rect x='0' y='0' width='{w}' height='{h}' rx='8' fill='#fff'/>
       <line x1='{left}' y1='{top}' x2='{left}' y2='{h-bottom}' stroke='#ddd'/>
       <line x1='{left}' y1='{h-bottom}' x2='{w-right}' y2='{h-bottom}' stroke='#ddd'/>
-      <line x1='{left}' y1='{y75:.1f}' x2='{w-right}' y2='{y75:.1f}' stroke='#dc2626' stroke-dasharray='4 4'/>
-      <line x1='{left}' y1='{y25:.1f}' x2='{w-right}' y2='{y25:.1f}' stroke='#16a34a' stroke-dasharray='4 4'/>
+      <line x1='{left}' y1='{y75:.1f}' x2='{w-right}' y2='{y75:.1f}' stroke='{GREED_COLOR}' stroke-dasharray='4 4'/>
+      <line x1='{left}' y1='{y25:.1f}' x2='{w-right}' y2='{y25:.1f}' stroke='{FEAR_COLOR}' stroke-dasharray='4 4'/>
       <text x='4' y='{y75+3:.1f}' font-size='9' fill='#999'>75</text>
       <text x='4' y='{y25+3:.1f}' font-size='9' fill='#999'>25</text>
       <polyline points='{' '.join(pts)}' fill='none' stroke='#2563eb' stroke-width='2.2'/>
@@ -252,11 +274,12 @@ def make_history_table(history, period_type, compact=False):
 
     rows = []
     for x in data:
-        c = value_color(x["value"])
+        cls = status_class(x["value"])
+        st = status_style(x["value"])
         rows.append(
             f"<tr><td>{safe(x['date'])}</td>"
-            f"<td style='color:{c};font-weight:700'>{x['value']}</td>"
-            f"<td>{safe(status_text(x['value']))}</td></tr>"
+            f"<td class='{cls}' style='{st}'>{x['value']}</td>"
+            f"<td class='{cls}' style='{st}'>{safe(status_text(x['value']))}</td></tr>"
         )
 
     return f"""
@@ -278,7 +301,7 @@ def make_card(name, source, stats, history, link=None, compact=False):
 
     warn = ""
     if stats["h30"] >= DANGER_DAYS_THRESHOLD:
-        warn = f"<div class='warn'>⚠️ 近30个{safe(pt)}内已有 {stats['h30']} 次极度贪婪，注意高位风险。</div>"
+        warn = f"<div class='warn'>⚠️ <span class='greed' style='color:{GREED_COLOR};font-weight:800'>贪婪风险</span>：近30个{safe(pt)}内已有 <span class='greed' style='color:{GREED_COLOR};font-weight:800'>{stats['h30']}</span> 次极度贪婪，注意高位风险。</div>"
 
     link_html = ""
     if link:
@@ -291,9 +314,9 @@ def make_card(name, source, stats, history, link=None, compact=False):
         <div class='num' style='color:{c}'>{v}<br><small>{safe(stats['status'])}</small></div>
       </div>
       <table class='sum'>
-        <tr><th>周期</th><th>恐慌&lt;{LIMIT_LOW}</th><th>贪婪&gt;{LIMIT_HIGH}</th></tr>
-        <tr><td>近30个{safe(pt)}</td><td>{stats['l30']}</td><td>{stats['h30']}</td></tr>
-        <tr><td>近60个{safe(pt)}</td><td>{stats['l60']}</td><td>{stats['h60']}</td></tr>
+        <tr><th>周期</th><th class='fear' style='color:{FEAR_COLOR};font-weight:800'>恐慌&lt;{LIMIT_LOW}</th><th class='greed' style='color:{GREED_COLOR};font-weight:800'>贪婪&gt;{LIMIT_HIGH}</th></tr>
+        <tr><td>近30个{safe(pt)}</td><td class='fear' style='color:{FEAR_COLOR};font-weight:800'>{stats['l30']}</td><td class='greed' style='color:{GREED_COLOR};font-weight:800'>{stats['h30']}</td></tr>
+        <tr><td>近60个{safe(pt)}</td><td class='fear' style='color:{FEAR_COLOR};font-weight:800'>{stats['l60']}</td><td class='greed' style='color:{GREED_COLOR};font-weight:800'>{stats['h60']}</td></tr>
       </table>
       {warn}
       <details>
@@ -321,7 +344,9 @@ def build_html(results, beijing_time_str, compact=False):
       .wrap{{max-width:620px;margin:0 auto;padding:12px}}
       h3{{text-align:center;margin:12px 0 16px}}.card{{background:#fff;border:1px solid #eee;border-radius:12px;padding:14px;margin:0 0 14px;box-shadow:0 2px 8px rgba(0,0,0,.04)}}
       .top{{display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid #eee;padding-bottom:9px;margin-bottom:9px}}.top span{{font-size:11px;color:#999}}.num{{font-size:28px;font-weight:800;text-align:right;line-height:1}}.num small{{font-size:11px}}
-      table{{width:100%;border-collapse:collapse;text-align:center}}th,td{{padding:6px;border-bottom:1px solid #eee;font-size:12px}}th{{background:#f8fafc}}.sum{{background:#fafafa}}.hist{{margin-top:8px}}.warn{{background:#fff7d6;color:#8a5b00;border:1px solid #f5dfa0;border-radius:6px;padding:8px;margin-top:8px;font-size:12px}}
+      table{{width:100%;border-collapse:collapse;text-align:center}}th,td{{padding:6px;border-bottom:1px solid #eee;font-size:12px}}th{{background:#f8fafc}}.sum{{background:#fafafa}}.hist{{margin-top:8px}}
+      .fear{{color:{FEAR_COLOR}!important;font-weight:800}}.greed{{color:{GREED_COLOR}!important;font-weight:800}}.neutral{{color:{NEUTRAL_COLOR};font-weight:600}}
+      .warn{{background:#fff1f2;color:#991b1b;border:1px solid #fecdd3;border-radius:6px;padding:8px;margin-top:8px;font-size:12px}}
       summary{{cursor:pointer;text-align:center;margin-top:10px;padding:8px;border:1px solid #bfdbfe;background:#eff6ff;color:#075985;border-radius:6px;font-size:13px;font-weight:700}}.chart{{margin-top:8px;border:1px solid #eee;border-radius:8px;overflow:hidden;background:#fff}}.btn{{display:block;text-align:center;background:#e7f5ff;color:#075985;text-decoration:none;border:1px solid #bfdbfe;border-radius:6px;padding:8px;font-weight:700;font-size:13px}}.foot{{background:#e9ecef;border-left:4px solid #2563eb;border-radius:8px;padding:12px;font-size:12px;line-height:1.7}}.note,.muted{{font-size:11px;color:#999;text-align:right}}.seq{{font-size:12px;line-height:1.8;color:#555}}.err{{background:#fee2e2}}
     </style>
     </head>
@@ -330,9 +355,9 @@ def build_html(results, beijing_time_str, compact=False):
       {cards}
       <div class='foot'>
         <b>📊 策略提示</b><br>
-        🟢 指数 &lt; {LIMIT_LOW}：可关注分批定投机会。<br>
-        🔴 指数 &gt; {LIMIT_HIGH}：可关注分批止盈风险。<br>
-        ⚠️ 近30个统计周期内极度贪婪次数 ≥ {DANGER_DAYS_THRESHOLD}：注意高位风险。<br>
+        <span class='fear' style='color:{FEAR_COLOR};font-weight:800'>🟢 恐慌机会：指数 &lt; {LIMIT_LOW}，可关注分批定投机会。</span><br>
+        <span class='greed' style='color:{GREED_COLOR};font-weight:800'>🔴 贪婪风险：指数 &gt; {LIMIT_HIGH}，可关注分批止盈风险。</span><br>
+        ⚠️ 近30个统计周期内<span class='greed' style='color:{GREED_COLOR};font-weight:800'>极度贪婪</span>次数 ≥ {DANGER_DAYS_THRESHOLD}：注意高位风险。<br>
         <span style='color:#999'>Data Updated: {safe(beijing_time_str)}</span>
       </div>
     </div></body></html>
