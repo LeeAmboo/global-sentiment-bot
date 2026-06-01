@@ -37,12 +37,11 @@ def value_color(value):
     if value < LIMIT_LOW:
         return FEAR_COLOR       # 绿色：恐慌机会区
     if value > LIMIT_HIGH:
-        return GREED_COLOR       # 红色：贪婪风险区
+        return GREED_COLOR      # 红色：贪婪风险区
     return "#333333"
 
 
 def status_class(value):
-    """用于 HTML 高亮：恐慌绿色，贪婪红色，中性普通。"""
     if value < LIMIT_LOW:
         return "fear"
     if value > LIMIT_HIGH:
@@ -51,7 +50,6 @@ def status_class(value):
 
 
 def status_style(value):
-    """关键字段使用内联样式，避免部分微信/HTML 渲染环境忽略 class。"""
     if value < LIMIT_LOW:
         return f"color:{FEAR_COLOR};font-weight:800"
     if value > LIMIT_HIGH:
@@ -60,7 +58,6 @@ def status_style(value):
 
 
 def dedupe_by_date(data):
-    """按日期去重，保留最靠前的数据。要求输入已按最新日期在前排列。"""
     if not data:
         return data
     seen = set()
@@ -75,11 +72,6 @@ def dedupe_by_date(data):
 
 # ================= RSI 计算：用于 A 股，及美股备用 =================
 def calculate_rsi_history(ticker, period="8mo"):
-    """
-    根据指数行情计算 RSI。
-    yfinance 返回的行情一般是交易日，因此结果天然接近交易日序列。
-    返回：[{"date":"YYYY-MM-DD", "value":整数}, ...]，最新日期在前。
-    """
     try:
         df = yf.download(ticker, period=period, progress=False, auto_adjust=False)
         if df.empty:
@@ -87,7 +79,6 @@ def calculate_rsi_history(ticker, period="8mo"):
             return None
 
         close = df["Close"]
-        # 兼容新版 yfinance 可能出现的多级列
         if hasattr(close, "columns"):
             close = close.iloc[:, 0]
 
@@ -111,12 +102,6 @@ def calculate_rsi_history(ticker, period="8mo"):
 
 # ================= 交易日过滤 =================
 def filter_by_trading_days(data, ticker, period="8mo"):
-    """
-    股票类资产按真实交易日过滤：
-    - 美股：^GSPC
-    - A股：000300.SS
-    比特币不需要过滤。
-    """
     if not data:
         return data
     try:
@@ -129,7 +114,6 @@ def filter_by_trading_days(data, ticker, period="8mo"):
         filtered = [d for d in data if d["date"] in trading_dates]
         print(f"✅ {ticker} 交易日过滤完成：原始 {len(data)} 条，过滤后 {len(filtered)} 条")
 
-        # 避免数据源日期不匹配导致后续统计失败
         if len(filtered) < 30:
             print(f"⚠️ {ticker} 过滤后不足30条，保留原始数据")
             return data
@@ -141,7 +125,6 @@ def filter_by_trading_days(data, ticker, period="8mo"):
 
 # ================= 三类数据获取 =================
 def get_us_data():
-    """美股：优先使用 CNN 官方恐慌贪婪指数，失败则用 S&P 500 RSI 替代。"""
     try:
         headers = {
             "User-Agent": "Mozilla/5.0",
@@ -166,7 +149,6 @@ def get_us_data():
 
 
 def get_crypto_data():
-    """比特币：Alternative.me 恐慌贪婪指数，按自然日统计。"""
     try:
         res = requests.get(CRYPTO_URL, timeout=15)
         res.raise_for_status()
@@ -184,7 +166,6 @@ def get_crypto_data():
 
 
 def get_cn_data():
-    """A股：用沪深300 RSI 作为情绪替代指标。"""
     return calculate_rsi_history(ASHARE_CODE), "沪深300 RSI"
 
 
@@ -216,9 +197,8 @@ def calc_stats(data, period_type):
     }
 
 
-# ================= HTML：压缩版，避免 PushPlus 超过 2 万字 =================
+# ================= HTML =================
 def make_svg_chart(history):
-    """近30日折线图，使用紧凑 SVG，不使用 JS，适合 PushPlus。"""
     if not history:
         return "<p class='muted'>暂无趋势图数据</p>"
 
@@ -236,8 +216,14 @@ def make_svg_chart(history):
         return top + (100 - v) / 100 * ph
 
     pts = []
+    dots = []
     for i, item in enumerate(data):
-        pts.append(f"{x_pos(i):.1f},{y_pos(item['value']):.1f}")
+        x = x_pos(i)
+        y = y_pos(item["value"])
+        val = item["value"]
+        pts.append(f"{x:.1f},{y:.1f}")
+        dot_color = value_color(val) if (val < LIMIT_LOW or val > LIMIT_HIGH) else "#2563eb"
+        dots.append(f"<circle cx='{x:.1f}' cy='{y:.1f}' r='2.2' fill='{dot_color}'/>")
 
     y25 = y_pos(25)
     y75 = y_pos(75)
@@ -251,9 +237,10 @@ def make_svg_chart(history):
       <line x1='{left}' y1='{h-bottom}' x2='{w-right}' y2='{h-bottom}' stroke='#ddd'/>
       <line x1='{left}' y1='{y75:.1f}' x2='{w-right}' y2='{y75:.1f}' stroke='{GREED_COLOR}' stroke-dasharray='4 4'/>
       <line x1='{left}' y1='{y25:.1f}' x2='{w-right}' y2='{y25:.1f}' stroke='{FEAR_COLOR}' stroke-dasharray='4 4'/>
-      <text x='4' y='{y75+3:.1f}' font-size='9' fill='#999'>75</text>
-      <text x='4' y='{y25+3:.1f}' font-size='9' fill='#999'>25</text>
+      <text x='4' y='{y75+3:.1f}' font-size='9' fill='{GREED_COLOR}'>75</text>
+      <text x='4' y='{y25+3:.1f}' font-size='9' fill='{FEAR_COLOR}'>25</text>
       <polyline points='{' '.join(pts)}' fill='none' stroke='#2563eb' stroke-width='2.2'/>
+      {''.join(dots)}
       <text x='{left}' y='{h-5}' font-size='9' fill='#999'>{safe(start)}</text>
       <text x='{w-right}' y='{h-5}' text-anchor='end' font-size='9' fill='#999'>{safe(end)}</text>
     </svg>
@@ -261,26 +248,46 @@ def make_svg_chart(history):
 
 
 def make_history_table(history, period_type, compact=False):
-    """近30个统计周期明细。compact=True 时进一步压缩，防止超长。"""
+    """
+    近30个统计周期明细：
+    - 纵向排列；
+    - 恐慌绿色；
+    - 贪婪红色；
+    - 中性灰色。
+    """
     if not history:
         return "<p class='muted'>暂无明细数据</p>"
 
     data = history[:30]
+    rows = []
+
+    for x in data:
+        val = int(x["value"])
+        st = status_text(val)
+        cls = status_class(val)
+        style = status_style(val)
+        date_txt = safe(x["date"])
+
+        if compact:
+            rows.append(
+                f"<p class='vrow'><span>{date_txt}</span> "
+                f"<b class='{cls}' style='{style}'>{val}</b> "
+                f"<em class='{cls}' style='{style}'>{safe(st)}</em></p>"
+            )
+        else:
+            rows.append(
+                f"<tr><td>{date_txt}</td>"
+                f"<td class='{cls}' style='{style}'>{val}</td>"
+                f"<td class='{cls}' style='{style}'>{safe(st)}</td></tr>"
+            )
 
     if compact:
-        # 极简形式：仍然显示每天数据，但比表格更短
-        pairs = " ｜ ".join([f"{x['date'][5:]}:{x['value']}" for x in data])
-        return f"<p class='seq'>{safe(pairs)}</p>"
-
-    rows = []
-    for x in data:
-        cls = status_class(x["value"])
-        st = status_style(x["value"])
-        rows.append(
-            f"<tr><td>{safe(x['date'])}</td>"
-            f"<td class='{cls}' style='{st}'>{x['value']}</td>"
-            f"<td class='{cls}' style='{st}'>{safe(status_text(x['value']))}</td></tr>"
-        )
+        return f"""
+        <div class='vlist'>
+          {''.join(rows)}
+        </div>
+        <p class='note'>股票类为近30个{safe(period_type)}；比特币为近30个自然日。</p>
+        """
 
     return f"""
     <table class='hist'>
@@ -342,12 +349,32 @@ def build_html(results, beijing_time_str, compact=False):
     <style>
       body{{margin:0;background:#f4f6f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#333}}
       .wrap{{max-width:620px;margin:0 auto;padding:12px}}
-      h3{{text-align:center;margin:12px 0 16px}}.card{{background:#fff;border:1px solid #eee;border-radius:12px;padding:14px;margin:0 0 14px;box-shadow:0 2px 8px rgba(0,0,0,.04)}}
-      .top{{display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid #eee;padding-bottom:9px;margin-bottom:9px}}.top span{{font-size:11px;color:#999}}.num{{font-size:28px;font-weight:800;text-align:right;line-height:1}}.num small{{font-size:11px}}
-      table{{width:100%;border-collapse:collapse;text-align:center}}th,td{{padding:6px;border-bottom:1px solid #eee;font-size:12px}}th{{background:#f8fafc}}.sum{{background:#fafafa}}.hist{{margin-top:8px}}
-      .fear{{color:{FEAR_COLOR}!important;font-weight:800}}.greed{{color:{GREED_COLOR}!important;font-weight:800}}.neutral{{color:{NEUTRAL_COLOR};font-weight:600}}
+      h3{{text-align:center;margin:12px 0 16px}}
+      .card{{background:#fff;border:1px solid #eee;border-radius:12px;padding:14px;margin:0 0 14px;box-shadow:0 2px 8px rgba(0,0,0,.04)}}
+      .top{{display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid #eee;padding-bottom:9px;margin-bottom:9px}}
+      .top span{{font-size:11px;color:#999}}
+      .num{{font-size:28px;font-weight:800;text-align:right;line-height:1}}
+      .num small{{font-size:11px}}
+      table{{width:100%;border-collapse:collapse;text-align:center}}
+      th,td{{padding:6px;border-bottom:1px solid #eee;font-size:12px}}
+      th{{background:#f8fafc}}
+      .sum{{background:#fafafa}}
+      .hist{{margin-top:8px}}
+      .fear{{color:{FEAR_COLOR}!important;font-weight:800}}
+      .greed{{color:{GREED_COLOR}!important;font-weight:800}}
+      .neutral{{color:{NEUTRAL_COLOR};font-weight:600}}
       .warn{{background:#fff1f2;color:#991b1b;border:1px solid #fecdd3;border-radius:6px;padding:8px;margin-top:8px;font-size:12px}}
-      summary{{cursor:pointer;text-align:center;margin-top:10px;padding:8px;border:1px solid #bfdbfe;background:#eff6ff;color:#075985;border-radius:6px;font-size:13px;font-weight:700}}.chart{{margin-top:8px;border:1px solid #eee;border-radius:8px;overflow:hidden;background:#fff}}.btn{{display:block;text-align:center;background:#e7f5ff;color:#075985;text-decoration:none;border:1px solid #bfdbfe;border-radius:6px;padding:8px;font-weight:700;font-size:13px}}.foot{{background:#e9ecef;border-left:4px solid #2563eb;border-radius:8px;padding:12px;font-size:12px;line-height:1.7}}.note,.muted{{font-size:11px;color:#999;text-align:right}}.seq{{font-size:12px;line-height:1.8;color:#555}}.err{{background:#fee2e2}}
+      summary{{cursor:pointer;text-align:center;margin-top:10px;padding:8px;border:1px solid #bfdbfe;background:#eff6ff;color:#075985;border-radius:6px;font-size:13px;font-weight:700}}
+      .chart{{margin-top:8px;border:1px solid #eee;border-radius:8px;overflow:hidden;background:#fff}}
+      .btn{{display:block;text-align:center;background:#e7f5ff;color:#075985;text-decoration:none;border:1px solid #bfdbfe;border-radius:6px;padding:8px;font-weight:700;font-size:13px}}
+      .foot{{background:#e9ecef;border-left:4px solid #2563eb;border-radius:8px;padding:12px;font-size:12px;line-height:1.7}}
+      .note,.muted{{font-size:11px;color:#999;text-align:right}}
+      .vlist{{margin-top:8px;border:1px solid #eee;border-radius:8px;background:#fff;padding:4px 8px}}
+      .vrow{{margin:0;padding:6px 0;border-bottom:1px solid #eee;font-size:13px;line-height:1.5;display:flex;justify-content:space-between;gap:8px}}
+      .vrow span{{color:#555}}
+      .vrow b{{min-width:34px;text-align:center}}
+      .vrow em{{font-style:normal;min-width:70px;text-align:right}}
+      .err{{background:#fee2e2}}
     </style>
     </head>
     <body><div class='wrap'>
@@ -451,12 +478,10 @@ def main():
 
     html_content = build_html(results, beijing_time_str, compact=False)
 
-    # 如果内容仍然过长，自动切换成极简明细，防止 PushPlus 拒收
     if len(html_content) > MAX_PUSHPLUS_LEN:
-        print(f"⚠️ HTML 长度 {len(html_content)} 超过安全阈值，切换为极简明细版本")
+        print(f"⚠️ HTML 长度 {len(html_content)} 超过安全阈值，切换为极简纵向明细版本")
         html_content = build_html(results, beijing_time_str, compact=True)
 
-    # 如果极简版仍超限，就只推送摘要，避免任务白跑
     if len(html_content) > MAX_PUSHPLUS_LEN:
         print(f"⚠️ 极简版仍过长：{len(html_content)}，改为只发送摘要")
         summary_lines = []
