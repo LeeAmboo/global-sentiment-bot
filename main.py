@@ -1,5 +1,6 @@
 import requests
 import os
+import html
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,8 @@ def calculate_rsi_history(ticker, period="6mo"):
     """
     根据指数行情计算 RSI。
     yfinance 返回的行情数据一般只包含交易日，因此该函数生成的数据天然接近交易日序列。
+    返回格式：[{"date": "YYYY-MM-DD", "value": int}, ...]
+    且按日期倒序排列，最新日期在最前。
     """
     try:
         df = yf.download(ticker, period=period, progress=False, auto_adjust=False)
@@ -57,7 +60,7 @@ def calculate_rsi_history(ticker, period="6mo"):
         for date, value in rsi_data.items():
             history.append({
                 "date": date.strftime("%Y-%m-%d"),
-                "value": int(value)
+                "value": int(round(float(value)))
             })
 
         return history
@@ -137,8 +140,8 @@ def get_us_data():
         data.sort(key=lambda x: x["x"], reverse=True)
 
         formatted = [{
-            "date": datetime.fromtimestamp(d["x"] / 1000).strftime("%Y-%m-%d"),
-            "value": int(d["y"])
+            "date": datetime.fromtimestamp(d["x"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d"),
+            "value": int(round(float(d["y"])))
         } for d in data]
 
         return formatted, "CNN 官方数据"
@@ -161,7 +164,7 @@ def get_crypto_data():
         data = res.json()["data"]
 
         return [{
-            "date": datetime.fromtimestamp(int(d["timestamp"])).strftime("%Y-%m-%d"),
+            "date": datetime.fromtimestamp(int(d["timestamp"]), tz=timezone.utc).strftime("%Y-%m-%d"),
             "value": int(d["value"])
         } for d in data], "Alternative.me"
 
@@ -207,11 +210,7 @@ def calc_stats(data, period_type="有效观测日"):
     l30, h30 = count(30)
     l60, h60 = count(60)
 
-    status_text = "中性震荡"
-    if current_val < LIMIT_LOW:
-        status_text = "极度恐慌（机会）"
-    elif current_val > LIMIT_HIGH:
-        status_text = "极度贪婪（风险）"
+    status_text = get_status_text(current_val)
 
     return {
         "val": current_val,
@@ -225,7 +224,7 @@ def calc_stats(data, period_type="有效观测日"):
     }
 
 
-# ================= HTML 生成器 =================
+# ================= HTML 工具函数 =================
 def get_color(value):
     """
     根据数值返回颜色。
@@ -238,12 +237,195 @@ def get_color(value):
     return "#333333"
 
 
-def generate_card_html(name, source, stats, link=None):
+def get_status_text(value):
+    if value < LIMIT_LOW:
+        return "极度恐慌（机会）"
+    if value > LIMIT_HIGH:
+        return "极度贪婪（风险）"
+    return "中性震荡"
+
+
+def fmt_mmdd(date_str):
+    """把 YYYY-MM-DD 简化为 MM-DD，用于图表横轴。"""
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").strftime("%m-%d")
+    except Exception:
+        return date_str
+
+
+def safe_html(text):
+    return html.escape(str(text), quote=True)
+
+
+def generate_svg_line_chart(history_data, period_type):
+    """
+    生成近30个统计周期的 SVG 折线图。
+    不依赖 JS、Chart.js、ECharts，适合 GitHub Actions 自动运行后通过 PushPlus 推送。
+    history_data 默认是倒序：最新在前；图中会改为从左到右按时间递增。
+    """
+    if not history_data:
+        return "<div style='font-size:12px;color:#999;text-align:center;'>暂无趋势图数据</div>"
+
+    data = history_data[:30]
+    if not data:
+        return "<div style='font-size:12px;color:#999;text-align:center;'>暂无趋势图数据</div>"
+
+    # 图表从左到右按时间递增
+    data = list(reversed(data))
+
+    width = 560
+    height = 220
+    left = 42
+    right = 16
+    top = 18
+    bottom = 38
+    plot_w = width - left - right
+    plot_h = height - top - bottom
+
+    def clamp(v, lo=0, hi=100):
+        return max(lo, min(hi, float(v)))
+
+    def x_pos(i):
+        if len(data) == 1:
+            return left + plot_w / 2
+        return left + i * plot_w / (len(data) - 1)
+
+    def y_pos(v):
+        v = clamp(v)
+        return top + (100 - v) / 100 * plot_h
+
+    points = []
+    circles = []
+
+    for i, item in enumerate(data):
+        x = x_pos(i)
+        y = y_pos(item["value"])
+        points.append(f"{x:.1f},{y:.1f}")
+        color = get_color(item["value"])
+        date = safe_html(item["date"])
+        value = safe_html(item["value"])
+        status = safe_html(get_status_text(item["value"]))
+        circles.append(
+            f"<circle cx='{x:.1f}' cy='{y:.1f}' r='3.2' fill='{color}'>"
+            f"<title>{date}：{value}，{status}</title>"
+            f"</circle>"
+        )
+
+    # 横向参考线：0、25、50、75、100
+    grid_lines = []
+    for v in [0, 25, 50, 75, 100]:
+        y = y_pos(v)
+        dash = "4 4" if v in [25, 75] else ""
+        line_color = "#28a745" if v == 25 else "#dc3545" if v == 75 else "#dddddd"
+        grid_lines.append(
+            f"<line x1='{left}' y1='{y:.1f}' x2='{width - right}' y2='{y:.1f}' "
+            f"stroke='{line_color}' stroke-width='1' stroke-dasharray='{dash}' opacity='0.75'/>"
+            f"<text x='{left - 8}' y='{y + 4:.1f}' text-anchor='end' font-size='10' fill='#888'>{v}</text>"
+        )
+
+    # 横轴日期标签：首日、中间、末日
+    date_labels = []
+    label_indices = sorted(set([0, len(data) // 2, len(data) - 1]))
+    for i in label_indices:
+        x = x_pos(i)
+        label = safe_html(fmt_mmdd(data[i]["date"]))
+        anchor = "middle"
+        if i == 0:
+            anchor = "start"
+        elif i == len(data) - 1:
+            anchor = "end"
+        date_labels.append(
+            f"<text x='{x:.1f}' y='{height - 12}' text-anchor='{anchor}' font-size='10' fill='#888'>{label}</text>"
+        )
+
+    start_date = safe_html(data[0]["date"])
+    end_date = safe_html(data[-1]["date"])
+
+    svg = f"""
+    <div style="margin-top:12px; background:#fbfbfb; border:1px solid #eeeeee; border-radius:8px; padding:8px; overflow-x:auto;">
+        <div style="font-size:12px; color:#666; margin-bottom:6px; text-align:center;">
+            近30个{safe_html(period_type)}趋势图（{start_date} 至 {end_date}）
+        </div>
+        <svg width="100%" viewBox="0 0 {width} {height}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="近30个{safe_html(period_type)}恐慌贪婪指数折线图">
+            <rect x="0" y="0" width="{width}" height="{height}" fill="#ffffff" rx="8"/>
+            {''.join(grid_lines)}
+            <line x1="{left}" y1="{top}" x2="{left}" y2="{height - bottom}" stroke="#dddddd" stroke-width="1"/>
+            <line x1="{left}" y1="{height - bottom}" x2="{width - right}" y2="{height - bottom}" stroke="#dddddd" stroke-width="1"/>
+            <polyline points="{' '.join(points)}" fill="none" stroke="#007bff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+            {''.join(circles)}
+            {''.join(date_labels)}
+            <text x="{width - right}" y="14" text-anchor="end" font-size="10" fill="#999">75 贪婪线 / 25 恐慌线</text>
+        </svg>
+    </div>
+    """
+    return svg
+
+
+def generate_history_table_html(history_data, period_type):
+    """
+    生成近30个统计周期每日明细表。
+    表格按倒序展示：最新日期在最上方。
+    """
+    if not history_data:
+        return "<div style='font-size:12px;color:#999;text-align:center;margin-top:8px;'>暂无明细数据</div>"
+
+    rows = []
+    for item in history_data[:30]:
+        value = item["value"]
+        color = get_color(value)
+        status = get_status_text(value)
+        rows.append(f"""
+        <tr style="border-bottom:1px solid #eeeeee;">
+            <td style="padding:6px; text-align:center;">{safe_html(item['date'])}</td>
+            <td style="padding:6px; text-align:center; font-weight:bold; color:{color};">{safe_html(value)}</td>
+            <td style="padding:6px; text-align:center; color:{color};">{safe_html(status)}</td>
+        </tr>
+        """)
+
+    return f"""
+    <div style="margin-top:10px; max-height:360px; overflow:auto; border:1px solid #eeeeee; border-radius:8px;">
+        <table style="width:100%; font-size:12px; border-collapse:collapse; background:#ffffff; color:#555;">
+            <thead>
+                <tr style="background:#f6f8fa; border-bottom:1px solid #eeeeee;">
+                    <th style="padding:7px; text-align:center;">日期</th>
+                    <th style="padding:7px; text-align:center;">指数</th>
+                    <th style="padding:7px; text-align:center;">状态</th>
+                </tr>
+            </thead>
+            <tbody>
+                {''.join(rows)}
+            </tbody>
+        </table>
+    </div>
+    <div style="margin-top:6px; font-size:11px; color:#999; text-align:right;">
+        注：股票类为近30个{safe_html(period_type)}；比特币为近30个自然日。
+    </div>
+    """
+
+
+def generate_history_detail_html(history_data, period_type):
+    chart_html = generate_svg_line_chart(history_data, period_type)
+    table_html = generate_history_table_html(history_data, period_type)
+    return f"""
+    <details style="margin-top:12px;">
+        <summary style="cursor:pointer; list-style:none; text-align:center; padding:9px 0; background-color:#f1f8ff; color:#0056b3; border:1px solid #b8daff; border-radius:6px; font-size:13px; font-weight:bold;">
+            📈 查看近30个{safe_html(period_type)}明细与趋势图
+        </summary>
+        <div style="margin-top:10px;">
+            {chart_html}
+            {table_html}
+        </div>
+    </details>
+    """
+
+
+# ================= HTML 生成器 =================
+def generate_card_html(name, source, stats, history_data=None, link=None):
     if not stats:
         return (
             f"<div style='padding:15px; background:#f8d7da; "
             f"border-radius:8px; margin-bottom:15px;'>"
-            f"❌ {name} 数据获取失败</div>"
+            f"❌ {safe_html(name)} 数据获取失败</div>"
         )
 
     color = get_color(stats["val"])
@@ -253,15 +435,17 @@ def generate_card_html(name, source, stats, link=None):
     if stats["h30"] >= DANGER_DAYS_THRESHOLD:
         warning_html = f"""
         <div style="margin-top:8px; padding:8px; background-color:#fff3cd; color:#856404; border-radius:4px; font-size:12px; border:1px solid #ffeeba;">
-            ⚠️ <b>高危预警</b>：近30个{period_type}内已有 {stats['h30']} 次处于极度贪婪区，建议关注高位风险。
+            ⚠️ <b>高危预警</b>：近30个{safe_html(period_type)}内已有 {stats['h30']} 次处于极度贪婪区，建议关注高位风险。
         </div>
         """
+
+    history_html = generate_history_detail_html(history_data or [], period_type)
 
     link_html = ""
     if link:
         link_html = f"""
         <div style="margin-top:12px; text-align:center;">
-            <a href="{link}" style="display:inline-block; width:90%; padding:8px 0; background-color:#e7f5ff; color:#0056b3; text-decoration:none; border-radius:4px; font-size:13px; font-weight:bold; border:1px solid #b8daff;">
+            <a href="{safe_html(link)}" style="display:inline-block; width:90%; padding:8px 0; background-color:#e7f5ff; color:#0056b3; text-decoration:none; border-radius:4px; font-size:13px; font-weight:bold; border:1px solid #b8daff;">
                 👉 点击查看 [韭圈儿] 详情
             </a>
         </div>
@@ -271,12 +455,12 @@ def generate_card_html(name, source, stats, link=None):
     <div style="margin-bottom:15px; padding:15px; background:#fff; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.05); border:1px solid #eee;">
         <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #f0f0f0; padding-bottom:10px; margin-bottom:10px;">
             <div>
-                <div style="font-size:16px; font-weight:bold; color:#333;">{name}</div>
-                <div style="font-size:11px; color:#999;">{stats['date']} | {source}</div>
+                <div style="font-size:16px; font-weight:bold; color:#333;">{safe_html(name)}</div>
+                <div style="font-size:11px; color:#999;">{safe_html(stats['date'])} | {safe_html(source)}</div>
             </div>
             <div style="text-align:right;">
-                <div style="font-size:26px; font-weight:bold; color:{color}; line-height:1;">{stats['val']}</div>
-                <div style="font-size:11px; color:{color}; margin-top:3px;">{stats['status']}</div>
+                <div style="font-size:26px; font-weight:bold; color:{color}; line-height:1;">{safe_html(stats['val'])}</div>
+                <div style="font-size:11px; color:{color}; margin-top:3px;">{safe_html(stats['status'])}</div>
             </div>
         </div>
 
@@ -287,19 +471,19 @@ def generate_card_html(name, source, stats, link=None):
                 <th style="color:#dc3545;">贪婪次数 (&gt;{LIMIT_HIGH})</th>
             </tr>
             <tr style="border-bottom:1px solid #eee;">
-                <td style="padding:6px;">近30个{period_type}</td>
-                <td><b>{stats['l30']}</b></td>
-                <td><b>{stats['h30']}</b></td>
+                <td style="padding:6px;">近30个{safe_html(period_type)}</td>
+                <td><b>{safe_html(stats['l30'])}</b></td>
+                <td><b>{safe_html(stats['h30'])}</b></td>
             </tr>
             <tr>
-                <td style="padding:6px;">近60个{period_type}</td>
-                <td><b>{stats['l60']}</b></td>
-                <td><b>{stats['h60']}</b></td>
+                <td style="padding:6px;">近60个{safe_html(period_type)}</td>
+                <td><b>{safe_html(stats['l60'])}</b></td>
+                <td><b>{safe_html(stats['h60'])}</b></td>
             </tr>
         </table>
 
         {warning_html}
-
+        {history_html}
         {link_html}
     </div>
     """
@@ -383,13 +567,19 @@ if __name__ == "__main__":
         if raw_data:
             print(f"{name} 原始数据条数：{len(raw_data)}")
 
-        # 股票类资产按真实交易日过滤
+        # 股票类资产按真实交易日过滤；比特币不需要过滤
         if ticker:
             raw_data = filter_by_trading_days(raw_data, ticker)
 
         stats = calc_stats(raw_data, period_type=period_type)
 
-        html_cards += generate_card_html(name, source_name, stats, link)
+        html_cards += generate_card_html(
+            name=name,
+            source=source_name,
+            stats=stats,
+            history_data=raw_data,
+            link=link
+        )
 
         if stats:
             asset_name = name.split(" ", 1)[1] if " " in name else name
@@ -413,9 +603,10 @@ if __name__ == "__main__":
             <li><span style="color:#28a745; font-weight:bold;">🟢 买入机会</span>：指数 <b>&lt; {LIMIT_LOW}</b> 时，可关注分批定投机会。</li>
             <li><span style="color:#dc3545; font-weight:bold;">🔴 止盈警示</span>：指数 <b>&gt; {LIMIT_HIGH}</b> 时，可关注分批止盈风险。</li>
             <li><span style="background:#fff3cd; padding:2px 4px; border-radius:2px;">⚠️ <b>高危信号</b></span>：股票类资产按交易日统计，比特币按自然日统计；若近30个统计周期内大于 {LIMIT_HIGH} 的次数超过 <b>{DANGER_DAYS_THRESHOLD} 次</b>，建议关注高位风险。</li>
+            <li>每张卡片中的“查看近30个统计周期明细与趋势图”可展开查看每日指数和折线图。</li>
         </ul>
         <div style="margin-top:8px; text-align:right; font-size:11px; color:#999;">
-            Data Updated: {beijing_time_str}
+            Data Updated: {safe_html(beijing_time_str)}
         </div>
     </div>
     """
