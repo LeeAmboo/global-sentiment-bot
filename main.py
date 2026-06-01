@@ -1,70 +1,87 @@
-import requests
 import os
 import html
+import requests
 import yfinance as yf
-import pandas as pd
 from datetime import datetime, timedelta, timezone
 
 # ================= 配置区域 =================
-# CNN 恐慌贪婪指数接口
 CNN_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
-
-# 比特币恐慌贪婪指数接口
 CRYPTO_URL = "https://api.alternative.me/fng/?limit=80"
-
-# A股指数：沪深300
-ASHARE_CODE = "000300.SS"
-
-# 韭圈儿链接
+ASHARE_CODE = "000300.SS"      # 沪深300
 JIUQUAN_URL = "https://funddb.cn/tool/fear"
 
-# 阈值设定
 LIMIT_LOW = 25
 LIMIT_HIGH = 75
 DANGER_DAYS_THRESHOLD = 10
+MAX_PUSHPLUS_LEN = 19000        # PushPlus 限制约 2 万字，留一点余量
 
 
-# ================= 核心逻辑：RSI 计算 =================
-def calculate_rsi_history(ticker, period="6mo"):
+# ================= 通用工具 =================
+def safe(x):
+    return html.escape(str(x), quote=True)
+
+
+def status_text(value):
+    if value < LIMIT_LOW:
+        return "极度恐慌"
+    if value > LIMIT_HIGH:
+        return "极度贪婪"
+    return "中性"
+
+
+def value_color(value):
+    if value < LIMIT_LOW:
+        return "#16a34a"       # 绿色：恐慌机会区
+    if value > LIMIT_HIGH:
+        return "#dc2626"       # 红色：贪婪风险区
+    return "#333333"
+
+
+def dedupe_by_date(data):
+    """按日期去重，保留最靠前的数据。要求输入已按最新日期在前排列。"""
+    if not data:
+        return data
+    seen = set()
+    out = []
+    for item in data:
+        d = item.get("date")
+        if d not in seen:
+            seen.add(d)
+            out.append(item)
+    return out
+
+
+# ================= RSI 计算：用于 A 股，及美股备用 =================
+def calculate_rsi_history(ticker, period="8mo"):
     """
     根据指数行情计算 RSI。
-    yfinance 返回的行情数据一般只包含交易日，因此该函数生成的数据天然接近交易日序列。
-    返回格式：[{"date": "YYYY-MM-DD", "value": int}, ...]
-    且按日期倒序排列，最新日期在最前。
+    yfinance 返回的行情一般是交易日，因此结果天然接近交易日序列。
+    返回：[{"date":"YYYY-MM-DD", "value":整数}, ...]，最新日期在前。
     """
     try:
         df = yf.download(ticker, period=period, progress=False, auto_adjust=False)
-
         if df.empty:
             print(f"❌ {ticker} 行情数据为空")
             return None
 
         close = df["Close"]
-
-        # 适配 yfinance 新版可能出现的多级列结构
-        if isinstance(close, pd.DataFrame):
+        # 兼容新版 yfinance 可能出现的多级列
+        if hasattr(close, "columns"):
             close = close.iloc[:, 0]
 
         delta = close.diff()
         gain = delta.clip(lower=0).rolling(14).mean()
         loss = -delta.clip(upper=0).rolling(14).mean()
-
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs))
 
-        history = []
-
-        # 最近 65 个有效 RSI 交易日，倒序排列
-        rsi_data = rsi.dropna().iloc[-65:][::-1]
-
-        for date, value in rsi_data.items():
-            history.append({
+        records = []
+        for date, value in rsi.dropna().iloc[-70:][::-1].items():
+            records.append({
                 "date": date.strftime("%Y-%m-%d"),
                 "value": int(round(float(value)))
             })
-
-        return history
-
+        return records
     except Exception as e:
         print(f"RSI Calculation Error for {ticker}: {e}")
         return None
@@ -73,149 +90,102 @@ def calculate_rsi_history(ticker, period="6mo"):
 # ================= 交易日过滤 =================
 def filter_by_trading_days(data, ticker, period="8mo"):
     """
-    用 yfinance 获取某个指数的真实交易日期，
-    再把恐慌贪婪指数数据过滤为交易日数据。
-
-    适用于：
+    股票类资产按真实交易日过滤：
     - 美股：^GSPC
     - A股：000300.SS
-
-    不适用于：
-    - 比特币，因为比特币是连续交易，不需要过滤周末。
+    比特币不需要过滤。
     """
     if not data:
         return data
-
     try:
         price_df = yf.download(ticker, period=period, progress=False, auto_adjust=False)
-
         if price_df.empty:
             print(f"⚠️ {ticker} 交易日数据为空，保留原始数据")
             return data
 
         trading_dates = set(price_df.index.strftime("%Y-%m-%d"))
-
-        filtered = [
-            d for d in data
-            if d["date"] in trading_dates
-        ]
-
+        filtered = [d for d in data if d["date"] in trading_dates]
         print(f"✅ {ticker} 交易日过滤完成：原始 {len(data)} 条，过滤后 {len(filtered)} 条")
 
-        # 如果过滤后数据太少，说明两个数据源日期可能不匹配，保留原数据以避免统计失败
+        # 避免数据源日期不匹配导致后续统计失败
         if len(filtered) < 30:
             print(f"⚠️ {ticker} 过滤后不足30条，保留原始数据")
             return data
-
         return filtered
-
     except Exception as e:
         print(f"Trading day filter failed for {ticker}: {e}")
         return data
 
 
-# ================= 数据获取接口 =================
+# ================= 三类数据获取 =================
 def get_us_data():
-    """
-    获取美股恐慌贪婪指数。
-    优先使用 CNN 官方数据，失败时用 S&P 500 RSI 替代。
-    """
+    """美股：优先使用 CNN 官方恐慌贪婪指数，失败则用 S&P 500 RSI 替代。"""
     try:
         headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/91.0.4472.124 Safari/537.36"
-            ),
+            "User-Agent": "Mozilla/5.0",
             "Referer": "https://www.cnn.com/",
             "Origin": "https://www.cnn.com"
         }
-
-        res = requests.get(CNN_URL, headers=headers, timeout=10)
+        res = requests.get(CNN_URL, headers=headers, timeout=15)
         res.raise_for_status()
+        raw = res.json()["fear_and_greed_historical"]["data"]
+        raw.sort(key=lambda x: x["x"], reverse=True)
 
-        data = res.json()["fear_and_greed_historical"]["data"]
-
-        # 时间倒序，最新日期排在最前面
-        data.sort(key=lambda x: x["x"], reverse=True)
-
-        formatted = [{
-            "date": datetime.fromtimestamp(d["x"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d"),
-            "value": int(round(float(d["y"])))
-        } for d in data]
-
-        return formatted, "CNN 官方数据"
-
+        data = []
+        for d in raw:
+            data.append({
+                "date": datetime.fromtimestamp(d["x"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d"),
+                "value": int(round(float(d["y"])))
+            })
+        return dedupe_by_date(data), "CNN官方"
     except Exception as e:
         print(f"CNN API Failed: {e}, Switching to S&P 500 RSI...")
-        rsi = calculate_rsi_history("^GSPC")
-        return rsi, "S&P 500 RSI 替代"
+        return calculate_rsi_history("^GSPC"), "S&P500 RSI替代"
 
 
 def get_crypto_data():
-    """
-    获取比特币恐慌贪婪指数。
-    比特币为连续交易，因此按自然日统计。
-    """
+    """比特币：Alternative.me 恐慌贪婪指数，按自然日统计。"""
     try:
-        res = requests.get(CRYPTO_URL, timeout=10)
+        res = requests.get(CRYPTO_URL, timeout=15)
         res.raise_for_status()
-
-        data = res.json()["data"]
-
-        return [{
-            "date": datetime.fromtimestamp(int(d["timestamp"]), tz=timezone.utc).strftime("%Y-%m-%d"),
-            "value": int(d["value"])
-        } for d in data], "Alternative.me"
-
+        raw = res.json()["data"]
+        data = []
+        for d in raw:
+            data.append({
+                "date": datetime.fromtimestamp(int(d["timestamp"]), tz=timezone.utc).strftime("%Y-%m-%d"),
+                "value": int(d["value"])
+            })
+        return dedupe_by_date(data), "Alternative.me"
     except Exception as e:
         print(f"Crypto API Failed: {e}")
         return None, "获取失败"
 
 
 def get_cn_data():
-    """
-    获取A股数据。
-    当前用沪深300 RSI 作为A股情绪替代指标。
-    """
-    data = calculate_rsi_history(ASHARE_CODE)
-    return data, "沪深300 RSI"
+    """A股：用沪深300 RSI 作为情绪替代指标。"""
+    return calculate_rsi_history(ASHARE_CODE), "沪深300 RSI"
 
 
-# ================= 统计分析 =================
-def calc_stats(data, period_type="有效观测日"):
-    """
-    统计近30个、近60个有效数据中的恐慌和贪婪次数。
-
-    对股票类资产：
-    - data 已提前过滤为交易日
-    - period_type = 交易日
-
-    对比特币：
-    - data 保留自然日
-    - period_type = 自然日
-    """
+# ================= 统计 =================
+def calc_stats(data, period_type):
     if not data:
         return None
 
-    current_val = data[0]["value"]
-    current_date = data[0]["date"]
+    current = data[0]
 
-    def count(limit_days):
-        sub_data = data[:limit_days]
-        low_count = sum(1 for d in sub_data if d["value"] < LIMIT_LOW)
-        high_count = sum(1 for d in sub_data if d["value"] > LIMIT_HIGH)
-        return low_count, high_count
+    def count(n):
+        sub = data[:n]
+        low = sum(1 for x in sub if x["value"] < LIMIT_LOW)
+        high = sum(1 for x in sub if x["value"] > LIMIT_HIGH)
+        return low, high
 
     l30, h30 = count(30)
     l60, h60 = count(60)
 
-    status_text = get_status_text(current_val)
-
     return {
-        "val": current_val,
-        "date": current_date,
-        "status": status_text,
+        "date": current["date"],
+        "val": current["value"],
+        "status": status_text(current["value"]),
         "l30": l30,
         "h30": h30,
         "l60": l60,
@@ -224,408 +194,261 @@ def calc_stats(data, period_type="有效观测日"):
     }
 
 
-# ================= HTML 工具函数 =================
-def get_color(value):
-    """
-    根据数值返回颜色。
-    绿色表示恐慌机会区，红色表示贪婪风险区。
-    """
-    if value < LIMIT_LOW:
-        return "#28a745"
-    if value > LIMIT_HIGH:
-        return "#dc3545"
-    return "#333333"
+# ================= HTML：压缩版，避免 PushPlus 超过 2 万字 =================
+def make_svg_chart(history):
+    """近30日折线图，使用紧凑 SVG，不使用 JS，适合 PushPlus。"""
+    if not history:
+        return "<p class='muted'>暂无趋势图数据</p>"
 
-
-def get_status_text(value):
-    if value < LIMIT_LOW:
-        return "极度恐慌（机会）"
-    if value > LIMIT_HIGH:
-        return "极度贪婪（风险）"
-    return "中性震荡"
-
-
-def fmt_mmdd(date_str):
-    """把 YYYY-MM-DD 简化为 MM-DD，用于图表横轴。"""
-    try:
-        return datetime.strptime(date_str, "%Y-%m-%d").strftime("%m-%d")
-    except Exception:
-        return date_str
-
-
-def safe_html(text):
-    return html.escape(str(text), quote=True)
-
-
-def generate_svg_line_chart(history_data, period_type):
-    """
-    生成近30个统计周期的 SVG 折线图。
-    不依赖 JS、Chart.js、ECharts，适合 GitHub Actions 自动运行后通过 PushPlus 推送。
-    history_data 默认是倒序：最新在前；图中会改为从左到右按时间递增。
-    """
-    if not history_data:
-        return "<div style='font-size:12px;color:#999;text-align:center;'>暂无趋势图数据</div>"
-
-    data = history_data[:30]
-    if not data:
-        return "<div style='font-size:12px;color:#999;text-align:center;'>暂无趋势图数据</div>"
-
-    # 图表从左到右按时间递增
-    data = list(reversed(data))
-
-    width = 560
-    height = 220
-    left = 42
-    right = 16
-    top = 18
-    bottom = 38
-    plot_w = width - left - right
-    plot_h = height - top - bottom
-
-    def clamp(v, lo=0, hi=100):
-        return max(lo, min(hi, float(v)))
+    data = list(reversed(history[:30]))
+    w, h = 360, 130
+    left, right, top, bottom = 28, 8, 10, 20
+    pw = w - left - right
+    ph = h - top - bottom
 
     def x_pos(i):
-        if len(data) == 1:
-            return left + plot_w / 2
-        return left + i * plot_w / (len(data) - 1)
+        return left + (pw / (len(data) - 1) * i if len(data) > 1 else pw / 2)
 
     def y_pos(v):
-        v = clamp(v)
-        return top + (100 - v) / 100 * plot_h
+        v = max(0, min(100, float(v)))
+        return top + (100 - v) / 100 * ph
 
-    points = []
-    circles = []
-
+    pts = []
     for i, item in enumerate(data):
-        x = x_pos(i)
-        y = y_pos(item["value"])
-        points.append(f"{x:.1f},{y:.1f}")
-        color = get_color(item["value"])
-        date = safe_html(item["date"])
-        value = safe_html(item["value"])
-        status = safe_html(get_status_text(item["value"]))
-        circles.append(
-            f"<circle cx='{x:.1f}' cy='{y:.1f}' r='3.2' fill='{color}'>"
-            f"<title>{date}：{value}，{status}</title>"
-            f"</circle>"
-        )
+        pts.append(f"{x_pos(i):.1f},{y_pos(item['value']):.1f}")
 
-    # 横向参考线：0、25、50、75、100
-    grid_lines = []
-    for v in [0, 25, 50, 75, 100]:
-        y = y_pos(v)
-        dash = "4 4" if v in [25, 75] else ""
-        line_color = "#28a745" if v == 25 else "#dc3545" if v == 75 else "#dddddd"
-        grid_lines.append(
-            f"<line x1='{left}' y1='{y:.1f}' x2='{width - right}' y2='{y:.1f}' "
-            f"stroke='{line_color}' stroke-width='1' stroke-dasharray='{dash}' opacity='0.75'/>"
-            f"<text x='{left - 8}' y='{y + 4:.1f}' text-anchor='end' font-size='10' fill='#888'>{v}</text>"
-        )
+    y25 = y_pos(25)
+    y75 = y_pos(75)
+    start = data[0]["date"][5:]
+    end = data[-1]["date"][5:]
 
-    # 横轴日期标签：首日、中间、末日
-    date_labels = []
-    label_indices = sorted(set([0, len(data) // 2, len(data) - 1]))
-    for i in label_indices:
-        x = x_pos(i)
-        label = safe_html(fmt_mmdd(data[i]["date"]))
-        anchor = "middle"
-        if i == 0:
-            anchor = "start"
-        elif i == len(data) - 1:
-            anchor = "end"
-        date_labels.append(
-            f"<text x='{x:.1f}' y='{height - 12}' text-anchor='{anchor}' font-size='10' fill='#888'>{label}</text>"
-        )
-
-    start_date = safe_html(data[0]["date"])
-    end_date = safe_html(data[-1]["date"])
-
-    svg = f"""
-    <div style="margin-top:12px; background:#fbfbfb; border:1px solid #eeeeee; border-radius:8px; padding:8px; overflow-x:auto;">
-        <div style="font-size:12px; color:#666; margin-bottom:6px; text-align:center;">
-            近30个{safe_html(period_type)}趋势图（{start_date} 至 {end_date}）
-        </div>
-        <svg width="100%" viewBox="0 0 {width} {height}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="近30个{safe_html(period_type)}恐慌贪婪指数折线图">
-            <rect x="0" y="0" width="{width}" height="{height}" fill="#ffffff" rx="8"/>
-            {''.join(grid_lines)}
-            <line x1="{left}" y1="{top}" x2="{left}" y2="{height - bottom}" stroke="#dddddd" stroke-width="1"/>
-            <line x1="{left}" y1="{height - bottom}" x2="{width - right}" y2="{height - bottom}" stroke="#dddddd" stroke-width="1"/>
-            <polyline points="{' '.join(points)}" fill="none" stroke="#007bff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
-            {''.join(circles)}
-            {''.join(date_labels)}
-            <text x="{width - right}" y="14" text-anchor="end" font-size="10" fill="#999">75 贪婪线 / 25 恐慌线</text>
-        </svg>
-    </div>
+    return f"""
+    <svg viewBox='0 0 {w} {h}' width='100%' xmlns='http://www.w3.org/2000/svg'>
+      <rect x='0' y='0' width='{w}' height='{h}' rx='8' fill='#fff'/>
+      <line x1='{left}' y1='{top}' x2='{left}' y2='{h-bottom}' stroke='#ddd'/>
+      <line x1='{left}' y1='{h-bottom}' x2='{w-right}' y2='{h-bottom}' stroke='#ddd'/>
+      <line x1='{left}' y1='{y75:.1f}' x2='{w-right}' y2='{y75:.1f}' stroke='#dc2626' stroke-dasharray='4 4'/>
+      <line x1='{left}' y1='{y25:.1f}' x2='{w-right}' y2='{y25:.1f}' stroke='#16a34a' stroke-dasharray='4 4'/>
+      <text x='4' y='{y75+3:.1f}' font-size='9' fill='#999'>75</text>
+      <text x='4' y='{y25+3:.1f}' font-size='9' fill='#999'>25</text>
+      <polyline points='{' '.join(pts)}' fill='none' stroke='#2563eb' stroke-width='2.2'/>
+      <text x='{left}' y='{h-5}' font-size='9' fill='#999'>{safe(start)}</text>
+      <text x='{w-right}' y='{h-5}' text-anchor='end' font-size='9' fill='#999'>{safe(end)}</text>
+    </svg>
     """
-    return svg
 
 
-def generate_history_table_html(history_data, period_type):
-    """
-    生成近30个统计周期每日明细表。
-    表格按倒序展示：最新日期在最上方。
-    """
-    if not history_data:
-        return "<div style='font-size:12px;color:#999;text-align:center;margin-top:8px;'>暂无明细数据</div>"
+def make_history_table(history, period_type, compact=False):
+    """近30个统计周期明细。compact=True 时进一步压缩，防止超长。"""
+    if not history:
+        return "<p class='muted'>暂无明细数据</p>"
+
+    data = history[:30]
+
+    if compact:
+        # 极简形式：仍然显示每天数据，但比表格更短
+        pairs = " ｜ ".join([f"{x['date'][5:]}:{x['value']}" for x in data])
+        return f"<p class='seq'>{safe(pairs)}</p>"
 
     rows = []
-    for item in history_data[:30]:
-        value = item["value"]
-        color = get_color(value)
-        status = get_status_text(value)
-        rows.append(f"""
-        <tr style="border-bottom:1px solid #eeeeee;">
-            <td style="padding:6px; text-align:center;">{safe_html(item['date'])}</td>
-            <td style="padding:6px; text-align:center; font-weight:bold; color:{color};">{safe_html(value)}</td>
-            <td style="padding:6px; text-align:center; color:{color};">{safe_html(status)}</td>
-        </tr>
-        """)
-
-    return f"""
-    <div style="margin-top:10px; max-height:360px; overflow:auto; border:1px solid #eeeeee; border-radius:8px;">
-        <table style="width:100%; font-size:12px; border-collapse:collapse; background:#ffffff; color:#555;">
-            <thead>
-                <tr style="background:#f6f8fa; border-bottom:1px solid #eeeeee;">
-                    <th style="padding:7px; text-align:center;">日期</th>
-                    <th style="padding:7px; text-align:center;">指数</th>
-                    <th style="padding:7px; text-align:center;">状态</th>
-                </tr>
-            </thead>
-            <tbody>
-                {''.join(rows)}
-            </tbody>
-        </table>
-    </div>
-    <div style="margin-top:6px; font-size:11px; color:#999; text-align:right;">
-        注：股票类为近30个{safe_html(period_type)}；比特币为近30个自然日。
-    </div>
-    """
-
-
-def generate_history_detail_html(history_data, period_type):
-    chart_html = generate_svg_line_chart(history_data, period_type)
-    table_html = generate_history_table_html(history_data, period_type)
-    return f"""
-    <details style="margin-top:12px;">
-        <summary style="cursor:pointer; list-style:none; text-align:center; padding:9px 0; background-color:#f1f8ff; color:#0056b3; border:1px solid #b8daff; border-radius:6px; font-size:13px; font-weight:bold;">
-            📈 查看近30个{safe_html(period_type)}明细与趋势图
-        </summary>
-        <div style="margin-top:10px;">
-            {chart_html}
-            {table_html}
-        </div>
-    </details>
-    """
-
-
-# ================= HTML 生成器 =================
-def generate_card_html(name, source, stats, history_data=None, link=None):
-    if not stats:
-        return (
-            f"<div style='padding:15px; background:#f8d7da; "
-            f"border-radius:8px; margin-bottom:15px;'>"
-            f"❌ {safe_html(name)} 数据获取失败</div>"
+    for x in data:
+        c = value_color(x["value"])
+        rows.append(
+            f"<tr><td>{safe(x['date'])}</td>"
+            f"<td style='color:{c};font-weight:700'>{x['value']}</td>"
+            f"<td>{safe(status_text(x['value']))}</td></tr>"
         )
 
-    color = get_color(stats["val"])
-    period_type = stats["period_type"]
+    return f"""
+    <table class='hist'>
+      <tr><th>日期</th><th>指数</th><th>状态</th></tr>
+      {''.join(rows)}
+    </table>
+    <p class='note'>股票类为近30个{safe(period_type)}；比特币为近30个自然日。</p>
+    """
 
-    warning_html = ""
+
+def make_card(name, source, stats, history, link=None, compact=False):
+    if not stats:
+        return f"<div class='card err'>❌ {safe(name)} 数据获取失败</div>"
+
+    v = stats["val"]
+    c = value_color(v)
+    pt = stats["period_type"]
+
+    warn = ""
     if stats["h30"] >= DANGER_DAYS_THRESHOLD:
-        warning_html = f"""
-        <div style="margin-top:8px; padding:8px; background-color:#fff3cd; color:#856404; border-radius:4px; font-size:12px; border:1px solid #ffeeba;">
-            ⚠️ <b>高危预警</b>：近30个{safe_html(period_type)}内已有 {stats['h30']} 次处于极度贪婪区，建议关注高位风险。
-        </div>
-        """
-
-    history_html = generate_history_detail_html(history_data or [], period_type)
+        warn = f"<div class='warn'>⚠️ 近30个{safe(pt)}内已有 {stats['h30']} 次极度贪婪，注意高位风险。</div>"
 
     link_html = ""
     if link:
-        link_html = f"""
-        <div style="margin-top:12px; text-align:center;">
-            <a href="{safe_html(link)}" style="display:inline-block; width:90%; padding:8px 0; background-color:#e7f5ff; color:#0056b3; text-decoration:none; border-radius:4px; font-size:13px; font-weight:bold; border:1px solid #b8daff;">
-                👉 点击查看 [韭圈儿] 详情
-            </a>
-        </div>
-        """
+        link_html = f"<p><a class='btn' href='{safe(link)}'>查看韭圈儿详情</a></p>"
 
     return f"""
-    <div style="margin-bottom:15px; padding:15px; background:#fff; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.05); border:1px solid #eee;">
-        <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #f0f0f0; padding-bottom:10px; margin-bottom:10px;">
-            <div>
-                <div style="font-size:16px; font-weight:bold; color:#333;">{safe_html(name)}</div>
-                <div style="font-size:11px; color:#999;">{safe_html(stats['date'])} | {safe_html(source)}</div>
-            </div>
-            <div style="text-align:right;">
-                <div style="font-size:26px; font-weight:bold; color:{color}; line-height:1;">{safe_html(stats['val'])}</div>
-                <div style="font-size:11px; color:{color}; margin-top:3px;">{safe_html(stats['status'])}</div>
-            </div>
-        </div>
-
-        <table style="width:100%; font-size:12px; text-align:center; border-collapse:collapse; color:#555; background-color:#f9f9f9; border-radius:6px;">
-            <tr style="border-bottom:1px solid #eee;">
-                <th style="padding:6px;">周期</th>
-                <th style="color:#28a745;">恐慌次数 (&lt;{LIMIT_LOW})</th>
-                <th style="color:#dc3545;">贪婪次数 (&gt;{LIMIT_HIGH})</th>
-            </tr>
-            <tr style="border-bottom:1px solid #eee;">
-                <td style="padding:6px;">近30个{safe_html(period_type)}</td>
-                <td><b>{safe_html(stats['l30'])}</b></td>
-                <td><b>{safe_html(stats['h30'])}</b></td>
-            </tr>
-            <tr>
-                <td style="padding:6px;">近60个{safe_html(period_type)}</td>
-                <td><b>{safe_html(stats['l60'])}</b></td>
-                <td><b>{safe_html(stats['h60'])}</b></td>
-            </tr>
-        </table>
-
-        {warning_html}
-        {history_html}
-        {link_html}
+    <div class='card'>
+      <div class='top'>
+        <div><b>{safe(name)}</b><br><span>{safe(stats['date'])}｜{safe(source)}</span></div>
+        <div class='num' style='color:{c}'>{v}<br><small>{safe(stats['status'])}</small></div>
+      </div>
+      <table class='sum'>
+        <tr><th>周期</th><th>恐慌&lt;{LIMIT_LOW}</th><th>贪婪&gt;{LIMIT_HIGH}</th></tr>
+        <tr><td>近30个{safe(pt)}</td><td>{stats['l30']}</td><td>{stats['h30']}</td></tr>
+        <tr><td>近60个{safe(pt)}</td><td>{stats['l60']}</td><td>{stats['h60']}</td></tr>
+      </table>
+      {warn}
+      <details>
+        <summary>📈 查看近30个{safe(pt)}明细与趋势图</summary>
+        <div class='chart'>{make_svg_chart(history)}</div>
+        {make_history_table(history, pt, compact=compact)}
+      </details>
+      {link_html}
     </div>
     """
 
 
-# ================= 推送发送 =================
+def build_html(results, beijing_time_str, compact=False):
+    cards = "".join(
+        make_card(r["name"], r["source"], r["stats"], r["history"], r.get("link"), compact=compact)
+        for r in results
+    )
+
+    return f"""
+    <html>
+    <head>
+    <meta charset='utf-8'>
+    <style>
+      body{{margin:0;background:#f4f6f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#333}}
+      .wrap{{max-width:620px;margin:0 auto;padding:12px}}
+      h3{text-align:center;margin:12px 0 16px}.card{{background:#fff;border:1px solid #eee;border-radius:12px;padding:14px;margin:0 0 14px;box-shadow:0 2px 8px rgba(0,0,0,.04)}}
+      .top{{display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid #eee;padding-bottom:9px;margin-bottom:9px}}.top span{{font-size:11px;color:#999}}.num{{font-size:28px;font-weight:800;text-align:right;line-height:1}}.num small{{font-size:11px}}
+      table{{width:100%;border-collapse:collapse;text-align:center}}th,td{{padding:6px;border-bottom:1px solid #eee;font-size:12px}}th{{background:#f8fafc}}.sum{{background:#fafafa}}.hist{{margin-top:8px}}.warn{{background:#fff7d6;color:#8a5b00;border:1px solid #f5dfa0;border-radius:6px;padding:8px;margin-top:8px;font-size:12px}}
+      summary{{cursor:pointer;text-align:center;margin-top:10px;padding:8px;border:1px solid #bfdbfe;background:#eff6ff;color:#075985;border-radius:6px;font-size:13px;font-weight:700}}.chart{{margin-top:8px;border:1px solid #eee;border-radius:8px;overflow:hidden;background:#fff}}.btn{{display:block;text-align:center;background:#e7f5ff;color:#075985;text-decoration:none;border:1px solid #bfdbfe;border-radius:6px;padding:8px;font-weight:700;font-size:13px}}.foot{{background:#e9ecef;border-left:4px solid #2563eb;border-radius:8px;padding:12px;font-size:12px;line-height:1.7}}.note,.muted{{font-size:11px;color:#999;text-align:right}}.seq{{font-size:12px;line-height:1.8;color:#555}}.err{{background:#fee2e2}}
+    </style>
+    </head>
+    <body><div class='wrap'>
+      <h3>🌍 全球核心资产情绪监控</h3>
+      {cards}
+      <div class='foot'>
+        <b>📊 策略提示</b><br>
+        🟢 指数 &lt; {LIMIT_LOW}：可关注分批定投机会。<br>
+        🔴 指数 &gt; {LIMIT_HIGH}：可关注分批止盈风险。<br>
+        ⚠️ 近30个统计周期内极度贪婪次数 ≥ {DANGER_DAYS_THRESHOLD}：注意高位风险。<br>
+        <span style='color:#999'>Data Updated: {safe(beijing_time_str)}</span>
+      </div>
+    </div></body></html>
+    """
+
+
+# ================= PushPlus 推送 =================
 def send_push(title, content):
     token = os.getenv("PUSHPLUS_TOKEN")
     topic = os.getenv("PUSHPLUS_TOPIC")
 
     if not token:
         print("❌ 未检测到 PUSHPLUS_TOKEN，跳过推送")
-        return
+        return False
+
+    print(f"📏 推送内容长度：{len(content)} 字符")
 
     url = "http://www.pushplus.plus/send"
-
-    data = {
+    payload = {
         "token": token,
         "title": title,
         "content": content,
-        "template": "html"
+        "template": "html",
+        "channel": "wechat"
     }
-
-    # topic 为空时，不传 topic，避免部分场景下推送异常
     if topic:
-        data["topic"] = topic
-
-    print(f"📡 准备推送到群组: {topic if topic else '无，单人推送'}")
+        payload["topic"] = topic
+        print(f"📡 准备推送到群组：{topic}")
+    else:
+        print("📡 准备推送到个人微信")
 
     try:
-        res = requests.post(url, json=data, timeout=10)
+        res = requests.post(url, json=payload, timeout=20)
         print(f"PushPlus Status Code: {res.status_code}")
         print(f"PushPlus Response: {res.text}")
-        print("✅ 推送请求已发送")
+
+        try:
+            result = res.json()
+        except Exception:
+            print("❌ PushPlus 返回不是 JSON")
+            return False
+
+        if result.get("code") == 200:
+            print("✅ PushPlus 返回 code=200，推送成功")
+            return True
+        else:
+            print(f"❌ PushPlus 推送失败：code={result.get('code')}，msg={result.get('msg')}，data={result.get('data')}")
+            return False
     except Exception as e:
         print(f"❌ 推送发送失败: {e}")
+        return False
 
 
 # ================= 主程序 =================
-if __name__ == "__main__":
+def main():
     print("🚀 开始分析全球市场情绪...")
 
-    parts = []
-    html_cards = ""
-
     tasks = [
-        {
-            "name": "🇺🇸 美股",
-            "getter": get_us_data,
-            "link": None,
-            "ticker": "^GSPC",
-            "period_type": "交易日"
-        },
-        {
-            "name": "₿ 比特币",
-            "getter": get_crypto_data,
-            "link": None,
-            "ticker": None,
-            "period_type": "自然日"
-        },
-        {
-            "name": "🇨🇳 A股",
-            "getter": get_cn_data,
-            "link": JIUQUAN_URL,
-            "ticker": ASHARE_CODE,
-            "period_type": "交易日"
-        }
+        {"name": "US 美股", "getter": get_us_data, "ticker": "^GSPC", "period_type": "交易日", "link": None},
+        {"name": "₿ 比特币", "getter": get_crypto_data, "ticker": None, "period_type": "自然日", "link": None},
+        {"name": "CN A股", "getter": get_cn_data, "ticker": ASHARE_CODE, "period_type": "交易日", "link": JIUQUAN_URL},
     ]
 
+    results = []
+    title_parts = []
+
     for task in tasks:
-        name = task["name"]
-        getter = task["getter"]
-        link = task["link"]
-        ticker = task["ticker"]
-        period_type = task["period_type"]
-
-        print(f"\n========== {name} ==========")
-
-        raw_data, source_name = getter()
-
+        print(f"\n========== {task['name']} ==========")
+        raw_data, source = task["getter"]()
         if raw_data:
-            print(f"{name} 原始数据条数：{len(raw_data)}")
+            print(f"{task['name']} 原始数据条数：{len(raw_data)}")
 
-        # 股票类资产按真实交易日过滤；比特币不需要过滤
-        if ticker:
-            raw_data = filter_by_trading_days(raw_data, ticker)
+        if task["ticker"]:
+            raw_data = filter_by_trading_days(raw_data, task["ticker"])
 
-        stats = calc_stats(raw_data, period_type=period_type)
-
-        html_cards += generate_card_html(
-            name=name,
-            source=source_name,
-            stats=stats,
-            history_data=raw_data,
-            link=link
-        )
+        stats = calc_stats(raw_data, task["period_type"])
+        results.append({
+            "name": task["name"],
+            "source": source,
+            "stats": stats,
+            "history": raw_data or [],
+            "link": task["link"]
+        })
 
         if stats:
-            asset_name = name.split(" ", 1)[1] if " " in name else name
-            parts.append(f"{asset_name}:{stats['val']}")
+            title_parts.append(f"{task['name'].split()[-1]}:{stats['val']}")
+            print(f"{task['name']} 当前值：{stats['val']}，近30个{task['period_type']}贪婪次数：{stats['h30']}，恐慌次数：{stats['l30']}")
 
-            print(
-                f"{name} 当前值：{stats['val']}，"
-                f"近30个{period_type}贪婪次数：{stats['h30']}，"
-                f"恐慌次数：{stats['l30']}"
-            )
-
-    # 计算北京时间
-    utc_now = datetime.now(timezone.utc)
-    beijing_time = utc_now + timedelta(hours=8)
+    beijing_time = datetime.now(timezone.utc) + timedelta(hours=8)
     beijing_time_str = beijing_time.strftime("%Y-%m-%d %H:%M") + "（北京时间）"
 
-    strategy_footer = f"""
-    <div style="margin-top:20px; padding:15px; background-color:#e9ecef; border-radius:8px; font-size:12px; color:#555; border-left:4px solid #007bff;">
-        <h4 style="margin:0 0 8px 0; color:#333;">📊 自动化定投/止盈策略提示</h4>
-        <ul style="padding-left:15px; margin:0; line-height:1.6;">
-            <li><span style="color:#28a745; font-weight:bold;">🟢 买入机会</span>：指数 <b>&lt; {LIMIT_LOW}</b> 时，可关注分批定投机会。</li>
-            <li><span style="color:#dc3545; font-weight:bold;">🔴 止盈警示</span>：指数 <b>&gt; {LIMIT_HIGH}</b> 时，可关注分批止盈风险。</li>
-            <li><span style="background:#fff3cd; padding:2px 4px; border-radius:2px;">⚠️ <b>高危信号</b></span>：股票类资产按交易日统计，比特币按自然日统计；若近30个统计周期内大于 {LIMIT_HIGH} 的次数超过 <b>{DANGER_DAYS_THRESHOLD} 次</b>，建议关注高位风险。</li>
-            <li>每张卡片中的“查看近30个统计周期明细与趋势图”可展开查看每日指数和折线图。</li>
-        </ul>
-        <div style="margin-top:8px; text-align:right; font-size:11px; color:#999;">
-            Data Updated: {safe_html(beijing_time_str)}
-        </div>
-    </div>
-    """
+    html_content = build_html(results, beijing_time_str, compact=False)
 
-    full_html = f"""
-    <html>
-    <body style="background-color:#f4f6f9; font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
-        <div style="max-width:600px; margin:0 auto;">
-            <h3 style="text-align:center; color:#333; margin:20px 0;">🌍 全球核心资产情绪监控</h3>
-            {html_cards}
-            {strategy_footer}
-        </div>
-    </body>
-    </html>
-    """
+    # 如果内容仍然过长，自动切换成极简明细，防止 PushPlus 拒收
+    if len(html_content) > MAX_PUSHPLUS_LEN:
+        print(f"⚠️ HTML 长度 {len(html_content)} 超过安全阈值，切换为极简明细版本")
+        html_content = build_html(results, beijing_time_str, compact=True)
 
-    if parts:
-        title_date = beijing_time.strftime("%m-%d")
-        title = f"{title_date} | " + " | ".join(parts)
-        send_push(title, full_html)
+    # 如果极简版仍超限，就只推送摘要，避免任务白跑
+    if len(html_content) > MAX_PUSHPLUS_LEN:
+        print(f"⚠️ 极简版仍过长：{len(html_content)}，改为只发送摘要")
+        summary_lines = []
+        for r in results:
+            s = r["stats"]
+            if s:
+                summary_lines.append(f"{r['name']}：{s['val']}，{s['status']}，近30个{s['period_type']}恐慌{s['l30']}次，贪婪{s['h30']}次")
+            else:
+                summary_lines.append(f"{r['name']}：数据获取失败")
+        html_content = "<br>".join(summary_lines) + f"<br><br>更新时间：{safe(beijing_time_str)}"
+
+    if title_parts:
+        title = beijing_time.strftime("%m-%d") + " | " + " | ".join(title_parts)
+        send_push(title, html_content)
     else:
         print("❌ 所有数据获取失败，未发送推送")
+
+
+if __name__ == "__main__":
+    main()
