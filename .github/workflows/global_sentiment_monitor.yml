@@ -1,11 +1,11 @@
 name: Global Sentiment Monitor
 
 on:
-  # 1. 定时触发：北京时间 6:50 运行
+  # 1. 定时触发：北京时间 6:30 运行
   # GitHub Actions 使用 UTC 时间
-  # 北京时间 6:50 = UTC 前一天 22:50
+  # 北京时间 6:30 = UTC 前一天 22:30
   schedule:
-    - cron: '50 22 * * *'
+    - cron: '30 22 * * *'
 
   # 2. 手动触发：允许点击 Run workflow
   workflow_dispatch:
