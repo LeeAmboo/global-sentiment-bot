@@ -48,11 +48,12 @@ jobs:
           test -f requirements.txt
           echo "Python 版本："
           python --version
+      
 
       - name: Run Monitor Script
         env:
-          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-          PUSHPLUS_TOPIC: ${{ secrets.PUSHPLUS_TOPIC }}
+         PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+         PUSHPLUS_TOPIC: GFI_Strategy
         run: |
           echo "Starting monitor script..."
           python main.py
