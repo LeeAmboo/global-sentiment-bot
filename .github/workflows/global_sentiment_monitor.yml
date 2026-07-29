@@ -35,10 +35,12 @@ jobs:
         with:
           python-version: '3.10'
 
+      # ！！！这里的代码已修改！！！
+      # 增加了 --upgrade 参数，强制云端拉取最新版本的依赖，避免缓存导致 API 依然报错
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install --upgrade -r requirements.txt
 
       - name: Check Python files
         run: |
@@ -48,8 +50,7 @@ jobs:
           test -f requirements.txt
           echo "Python 版本："
           python --version
-      
-
+        
       - name: Run Monitor Script
         env:
          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
