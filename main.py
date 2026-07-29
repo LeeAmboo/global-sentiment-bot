@@ -180,7 +180,7 @@ def get_cn_data():
         hs300['Volume_Score'] = np.clip((hs300['Vol_Ratio'] - 0.5) / 1.0 * 100, 0, 100)
 
         # 5. 合成综合情绪指数
-        hs300['Fear_Greed_Score'] = (hs300['RSI'] * 0.4) + (hs300['Momentum_Score'] * 0.4) + (hs300['Volume_Score'] * 0.2)
+        hs300['Fear_Greed_Score'] = (hs300['RSI'] * 0.4) + (hs300['Momentum_Score'] * 0.3) + (hs300['Volume_Score'] * 0.3)
         
         # 提取最近 70 个交易日
         recent_data = hs300.dropna().iloc[-70:].copy()
