@@ -96,37 +96,25 @@ def calculate_rsi_history(ticker, period="8mo"):
         return None
 
 
-# ================= 交易日过滤 =================
-def filter_by_trading_days(data, ticker, period="8mo"):
-    if not data:
-        return data
-    try:
-        price_df = yf.download(ticker, period=period, progress=False, auto_adjust=False)
-        if price_df.empty:
-            return data
-        trading_dates = set(price_df.index.strftime("%Y-%m-%d"))
-        filtered = [d for d in data if d["date"] in trading_dates]
-        if len(filtered) < 30:
-            return data
-        return filtered
-    except Exception:
-        return data
-
-
 # ================= 三类数据获取 =================
 def get_us_data():
-    """美股：使用 fear-greed 开源库，失败则降级使用 S&P500 RSI"""
+    """美股：修复 dict 对象读取，使用 fear-greed"""
     try:
-        # 获取最新的情绪数据，由于库自身设计，历史数据我们拉取快照
         idx = fear_greed.get()
-        # 目前 fear-greed 返回当前时间，为构建历史图表，我们用 yfinance 补全交易日历史作为趋势
-        # 实际操作中，如果你需要纯正的 CNN 历史曲线，仍需通过内部 API。这里混合使用。
         history_records = calculate_rsi_history("^GSPC")
+        
+        # 兼容不同版本的 fear-greed 库返回类型（字典 vs 对象）
+        if isinstance(idx, dict):
+            current_val = float(idx.get('value', idx.get('score', 50)))
+        else:
+            current_val = float(idx.value)
+            
+        current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        
         if history_records:
-            # 将最新的 fear-greed 官方评分替换今日/昨日数据
             history_records.insert(0, {
-                "date": idx.last_update.strftime("%Y-%m-%d") if hasattr(idx, 'last_update') else datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                "value": int(round(idx.value))
+                "date": current_date,
+                "value": int(round(current_val))
             })
             return dedupe_by_date(history_records), "fear-greed官方+历史RSI"
         else:
@@ -156,15 +144,21 @@ def get_crypto_data():
 
 def get_cn_data():
     """
-    A股：通过 AkShare 提取沪深300数据，构建多因子贪恐指数
+    A股：切换为新浪源，绕过东方财富的 IP 封锁
     因子：RSI (40%) + 125日市场动量 (40%) + 30日成交量情绪 (20%)
     """
     try:
-        # 1. 抓取沪深300历史日线 (无需 API Token)
-        hs300 = ak.stock_zh_index_daily_em(symbol="sh000300")
-        hs300.rename(columns={'date': 'date', 'close': 'close', 'volume': 'volume'}, inplace=True)
+        # 1. 抓取沪深300历史日线 (替换为新浪源接口，抗封锁能力强)
+        hs300 = ak.stock_zh_index_daily(symbol="sh000300")
+        
+        # 将所有列名统一转换为小写，防止不同源大小写不一致导致的 KeyError
+        hs300.columns = [col.lower() for col in hs300.columns]
+        
+        # 确保关键列存在且类型正确
         hs300['date'] = pd.to_datetime(hs300['date'])
         hs300.set_index('date', inplace=True)
+        hs300['close'] = pd.to_numeric(hs300['close'])
+        hs300['volume'] = pd.to_numeric(hs300['volume'])
 
         # 2. 计算 RSI
         delta = hs300['close'].diff()
@@ -198,10 +192,10 @@ def get_cn_data():
                 "value": int(round(row['Fear_Greed_Score']))
             })
             
-        return dedupe_by_date(records), "AkShare 多因子模型"
+        return dedupe_by_date(records), "AkShare 多因子模型 (新浪源)"
     except Exception as e:
         print(f"A-Share Calculation Error: {e}")
-        # 如果 AkShare 失败，回退到原有的 yfinance RSI（防止完全断更）
+        # 如果新浪源也失败，回退到原有的 yfinance RSI
         return calculate_rsi_history("000300.SS"), "沪深300 RSI (降级)"
 
 
@@ -412,7 +406,6 @@ def main():
 
     for task in tasks:
         raw_data, source = task["getter"]()
-        # US/CN 已经在函数内处理了交易日，比特币为自然日，无需调用 filter_by_trading_days
         stats = calc_stats(raw_data, task["period_type"])
         results.append({
             "name": task["name"],
