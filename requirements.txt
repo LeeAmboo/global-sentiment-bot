@@ -1,6 +1,6 @@
 requests
 yfinance
-fear-greed
 akshare
 pandas
 numpy
+fear-greed
