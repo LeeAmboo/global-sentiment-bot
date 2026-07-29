@@ -2,12 +2,14 @@ import os
 import html
 import requests
 import yfinance as yf
+import akshare as ak
+import pandas as pd
+import numpy as np
+import fear_greed
 from datetime import datetime, timedelta, timezone
 
 # ================= 配置区域 =================
-CNN_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 CRYPTO_URL = "https://api.alternative.me/fng/?limit=80"
-ASHARE_CODE = "000300.SS"      # 沪深300
 JIUQUAN_URL = "https://funddb.cn/tool/fear"
 
 LIMIT_LOW = 25
@@ -24,7 +26,6 @@ NEUTRAL_COLOR = "#555555"       # 中性：深灰
 def safe(x):
     return html.escape(str(x), quote=True)
 
-
 def status_text(value):
     if value < LIMIT_LOW:
         return "极度恐慌"
@@ -32,35 +33,28 @@ def status_text(value):
         return "极度贪婪"
     return "中性"
 
-
 def value_color(value):
     if value < LIMIT_LOW:
-        return FEAR_COLOR       # 绿色：恐慌机会区
+        return FEAR_COLOR
     if value > LIMIT_HIGH:
-        return GREED_COLOR       # 红色：贪婪风险区
+        return GREED_COLOR
     return "#333333"
 
-
 def status_class(value):
-    """用于 HTML 高亮：恐慌绿色，贪婪红色，中性普通。"""
     if value < LIMIT_LOW:
         return "fear"
     if value > LIMIT_HIGH:
         return "greed"
     return "neutral"
 
-
 def status_style(value):
-    """关键字段使用内联样式，避免部分微信/HTML 渲染环境忽略 class。"""
     if value < LIMIT_LOW:
         return f"color:{FEAR_COLOR};font-weight:800"
     if value > LIMIT_HIGH:
         return f"color:{GREED_COLOR};font-weight:800"
     return f"color:{NEUTRAL_COLOR};font-weight:600"
 
-
 def dedupe_by_date(data):
-    """按日期去重，保留最靠前的数据。要求输入已按最新日期在前排列。"""
     if not data:
         return data
     seen = set()
@@ -73,21 +67,14 @@ def dedupe_by_date(data):
     return out
 
 
-# ================= RSI 计算：用于 A 股，及美股备用 =================
+# ================= 备用 RSI 计算 =================
 def calculate_rsi_history(ticker, period="8mo"):
-    """
-    根据指数行情计算 RSI。
-    yfinance 返回的行情一般是交易日，因此结果天然接近交易日序列。
-    返回：[{"date":"YYYY-MM-DD", "value":整数}, ...]，最新日期在前。
-    """
+    """如果主 API 失败，降级使用 yfinance 计算 RSI 作为情绪替代"""
     try:
         df = yf.download(ticker, period=period, progress=False, auto_adjust=False)
         if df.empty:
-            print(f"❌ {ticker} 行情数据为空")
             return None
-
         close = df["Close"]
-        # 兼容新版 yfinance 可能出现的多级列
         if hasattr(close, "columns"):
             close = close.iloc[:, 0]
 
@@ -111,62 +98,46 @@ def calculate_rsi_history(ticker, period="8mo"):
 
 # ================= 交易日过滤 =================
 def filter_by_trading_days(data, ticker, period="8mo"):
-    """
-    股票类资产按真实交易日过滤：
-    - 美股：^GSPC
-    - A股：000300.SS
-    比特币不需要过滤。
-    """
     if not data:
         return data
     try:
         price_df = yf.download(ticker, period=period, progress=False, auto_adjust=False)
         if price_df.empty:
-            print(f"⚠️ {ticker} 交易日数据为空，保留原始数据")
             return data
-
         trading_dates = set(price_df.index.strftime("%Y-%m-%d"))
         filtered = [d for d in data if d["date"] in trading_dates]
-        print(f"✅ {ticker} 交易日过滤完成：原始 {len(data)} 条，过滤后 {len(filtered)} 条")
-
-        # 避免数据源日期不匹配导致后续统计失败
         if len(filtered) < 30:
-            print(f"⚠️ {ticker} 过滤后不足30条，保留原始数据")
             return data
         return filtered
-    except Exception as e:
-        print(f"Trading day filter failed for {ticker}: {e}")
+    except Exception:
         return data
 
 
 # ================= 三类数据获取 =================
 def get_us_data():
-    """美股：优先使用 CNN 官方恐慌贪婪指数，失败则用 S&P 500 RSI 替代。"""
+    """美股：使用 fear-greed 开源库，失败则降级使用 S&P500 RSI"""
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://www.cnn.com/",
-            "Origin": "https://www.cnn.com"
-        }
-        res = requests.get(CNN_URL, headers=headers, timeout=15)
-        res.raise_for_status()
-        raw = res.json()["fear_and_greed_historical"]["data"]
-        raw.sort(key=lambda x: x["x"], reverse=True)
-
-        data = []
-        for d in raw:
-            data.append({
-                "date": datetime.fromtimestamp(d["x"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d"),
-                "value": int(round(float(d["y"])))
+        # 获取最新的情绪数据，由于库自身设计，历史数据我们拉取快照
+        idx = fear_greed.get()
+        # 目前 fear-greed 返回当前时间，为构建历史图表，我们用 yfinance 补全交易日历史作为趋势
+        # 实际操作中，如果你需要纯正的 CNN 历史曲线，仍需通过内部 API。这里混合使用。
+        history_records = calculate_rsi_history("^GSPC")
+        if history_records:
+            # 将最新的 fear-greed 官方评分替换今日/昨日数据
+            history_records.insert(0, {
+                "date": idx.last_update.strftime("%Y-%m-%d") if hasattr(idx, 'last_update') else datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                "value": int(round(idx.value))
             })
-        return dedupe_by_date(data), "CNN官方"
+            return dedupe_by_date(history_records), "fear-greed官方+历史RSI"
+        else:
+            return None, "获取失败"
     except Exception as e:
-        print(f"CNN API Failed: {e}, Switching to S&P 500 RSI...")
+        print(f"US Fear-Greed API Failed: {e}, Switching to S&P 500 RSI...")
         return calculate_rsi_history("^GSPC"), "S&P500 RSI替代"
 
 
 def get_crypto_data():
-    """比特币：Alternative.me 恐慌贪婪指数，按自然日统计。"""
+    """比特币：Alternative.me"""
     try:
         res = requests.get(CRYPTO_URL, timeout=15)
         res.raise_for_status()
@@ -184,11 +155,57 @@ def get_crypto_data():
 
 
 def get_cn_data():
-    """A股：用沪深300 RSI 作为情绪替代指标。"""
-    return calculate_rsi_history(ASHARE_CODE), "沪深300 RSI"
+    """
+    A股：通过 AkShare 提取沪深300数据，构建多因子贪恐指数
+    因子：RSI (40%) + 125日市场动量 (40%) + 30日成交量情绪 (20%)
+    """
+    try:
+        # 1. 抓取沪深300历史日线 (无需 API Token)
+        hs300 = ak.stock_zh_index_daily_em(symbol="sh000300")
+        hs300.rename(columns={'date': 'date', 'close': 'close', 'volume': 'volume'}, inplace=True)
+        hs300['date'] = pd.to_datetime(hs300['date'])
+        hs300.set_index('date', inplace=True)
+
+        # 2. 计算 RSI
+        delta = hs300['close'].diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = -delta.clip(upper=0).rolling(14).mean()
+        rs = gain / loss
+        hs300['RSI'] = 100 - (100 / (1 + rs))
+
+        # 3. 市场动量 (Momentum)：125日均线乖离率 (BIAS)
+        hs300['MA125'] = hs300['close'].rolling(window=125).mean()
+        hs300['BIAS'] = (hs300['close'] - hs300['MA125']) / hs300['MA125'] * 100
+        # 归一化：将 BIAS 限定在 [-15%, +15%] 区间，映射到 [0, 100] 分数
+        hs300['Momentum_Score'] = np.clip((hs300['BIAS'] + 15) / 30 * 100, 0, 100)
+
+        # 4. 成交量情绪 (Volume)：当前成交量 / 30日均量
+        hs300['Vol_MA30'] = hs300['volume'].rolling(window=30).mean()
+        hs300['Vol_Ratio'] = hs300['volume'] / hs300['Vol_MA30']
+        # 归一化：均量的 0.5倍 到 1.5倍 映射到 [0, 100]
+        hs300['Volume_Score'] = np.clip((hs300['Vol_Ratio'] - 0.5) / 1.0 * 100, 0, 100)
+
+        # 5. 合成综合情绪指数
+        hs300['Fear_Greed_Score'] = (hs300['RSI'] * 0.4) + (hs300['Momentum_Score'] * 0.4) + (hs300['Volume_Score'] * 0.2)
+        
+        # 提取最近 70 个交易日
+        recent_data = hs300.dropna().iloc[-70:].copy()
+        
+        records = []
+        for date, row in recent_data.iloc[::-1].iterrows():
+            records.append({
+                "date": date.strftime("%Y-%m-%d"),
+                "value": int(round(row['Fear_Greed_Score']))
+            })
+            
+        return dedupe_by_date(records), "AkShare 多因子模型"
+    except Exception as e:
+        print(f"A-Share Calculation Error: {e}")
+        # 如果 AkShare 失败，回退到原有的 yfinance RSI（防止完全断更）
+        return calculate_rsi_history("000300.SS"), "沪深300 RSI (降级)"
 
 
-# ================= 统计 =================
+# ================= 统计计算 =================
 def calc_stats(data, period_type):
     if not data:
         return None
@@ -216,9 +233,8 @@ def calc_stats(data, period_type):
     }
 
 
-# ================= HTML：压缩版，避免 PushPlus 超过 2 万字 =================
+# ================= HTML 视图渲染 =================
 def make_svg_chart(history):
-    """近30日折线图，使用紧凑 SVG，不使用 JS，适合 PushPlus。"""
     if not history:
         return "<p class='muted'>暂无趋势图数据</p>"
 
@@ -259,19 +275,13 @@ def make_svg_chart(history):
     </svg>
     """
 
-
 def make_history_table(history, period_type, compact=False):
-    """近30个统计周期明细。compact=True 时进一步压缩，防止超长。"""
     if not history:
         return "<p class='muted'>暂无明细数据</p>"
-
     data = history[:30]
-
     if compact:
-        # 极简形式：仍然显示每天数据，但比表格更短
         pairs = " ｜ ".join([f"{x['date'][5:]}:{x['value']}" for x in data])
         return f"<p class='seq'>{safe(pairs)}</p>"
-
     rows = []
     for x in data:
         cls = status_class(x["value"])
@@ -281,7 +291,6 @@ def make_history_table(history, period_type, compact=False):
             f"<td class='{cls}' style='{st}'>{x['value']}</td>"
             f"<td class='{cls}' style='{st}'>{safe(status_text(x['value']))}</td></tr>"
         )
-
     return f"""
     <table class='hist'>
       <tr><th>日期</th><th>指数</th><th>状态</th></tr>
@@ -290,23 +299,18 @@ def make_history_table(history, period_type, compact=False):
     <p class='note'>股票类为近30个{safe(period_type)}；比特币为近30个自然日。</p>
     """
 
-
 def make_card(name, source, stats, history, link=None, compact=False):
     if not stats:
         return f"<div class='card err'>❌ {safe(name)} 数据获取失败</div>"
-
     v = stats["val"]
     c = value_color(v)
     pt = stats["period_type"]
-
     warn = ""
     if stats["h30"] >= DANGER_DAYS_THRESHOLD:
-        warn = f"<div class='warn'>⚠️ <span class='greed' style='color:{GREED_COLOR};font-weight:800'>贪婪风险</span>：近30个{safe(pt)}内已有 <span class='greed' style='color:{GREED_COLOR};font-weight:800'>{stats['h30']}</span> 次极度贪婪，注意高位风险。</div>"
-
+        warn = f"<div class='warn'>⚠️ <span class='greed' style='color:{GREED_COLOR};font-weight:800'>贪婪风险</span>：近30个{safe(pt)}内已有 <span class='greed' style='color:{GREED_COLOR};font-weight:800'>{stats['h30']}</span> 次极度贪婪。</div>"
     link_html = ""
     if link:
-        link_html = f"<p><a class='btn' href='{safe(link)}'>查看韭圈儿详情</a></p>"
-
+        link_html = f"<p><a class='btn' href='{safe(link)}'>查看详细走势</a></p>"
     return f"""
     <div class='card'>
       <div class='top'>
@@ -320,7 +324,7 @@ def make_card(name, source, stats, history, link=None, compact=False):
       </table>
       {warn}
       <details>
-        <summary>📈 查看近30个{safe(pt)}明细与趋势图</summary>
+        <summary>📈 查看近30个{safe(pt)}趋势图</summary>
         <div class='chart'>{make_svg_chart(history)}</div>
         {make_history_table(history, pt, compact=compact)}
       </details>
@@ -328,13 +332,11 @@ def make_card(name, source, stats, history, link=None, compact=False):
     </div>
     """
 
-
 def build_html(results, beijing_time_str, compact=False):
     cards = "".join(
         make_card(r["name"], r["source"], r["stats"], r["history"], r.get("link"), compact=compact)
         for r in results
     )
-
     return f"""
     <html>
     <head>
@@ -355,9 +357,9 @@ def build_html(results, beijing_time_str, compact=False):
       {cards}
       <div class='foot'>
         <b>📊 策略提示</b><br>
-        <span class='fear' style='color:{FEAR_COLOR};font-weight:800'>🟢 恐慌机会：指数 &lt; {LIMIT_LOW}，可关注分批定投机会。</span><br>
-        <span class='greed' style='color:{GREED_COLOR};font-weight:800'>🔴 贪婪风险：指数 &gt; {LIMIT_HIGH}，可关注分批止盈风险。</span><br>
-        ⚠️ 近30个统计周期内<span class='greed' style='color:{GREED_COLOR};font-weight:800'>极度贪婪</span>次数 ≥ {DANGER_DAYS_THRESHOLD}：注意高位风险。<br>
+        <span class='fear' style='color:{FEAR_COLOR};font-weight:800'>🟢 恐慌机会：指数 &lt; {LIMIT_LOW}，关注定投。</span><br>
+        <span class='greed' style='color:{GREED_COLOR};font-weight:800'>🔴 贪婪风险：指数 &gt; {LIMIT_HIGH}，关注止盈。</span><br>
+        ⚠️ 近30天<span class='greed' style='color:{GREED_COLOR};font-weight:800'>极度贪婪</span> ≥ {DANGER_DAYS_THRESHOLD} 次：注意高位。<br>
         <span style='color:#999'>Data Updated: {safe(beijing_time_str)}</span>
       </div>
     </div></body></html>
@@ -368,13 +370,9 @@ def build_html(results, beijing_time_str, compact=False):
 def send_push(title, content):
     token = os.getenv("PUSHPLUS_TOKEN")
     topic = os.getenv("PUSHPLUS_TOPIC")
-
     if not token:
         print("❌ 未检测到 PUSHPLUS_TOKEN，跳过推送")
         return False
-
-    print(f"📏 推送内容长度：{len(content)} 字符")
-
     url = "http://www.pushplus.plus/send"
     payload = {
         "token": token,
@@ -385,29 +383,17 @@ def send_push(title, content):
     }
     if topic:
         payload["topic"] = topic
-        print(f"📡 准备推送到群组：{topic}")
-    else:
-        print("📡 准备推送到个人微信")
-
     try:
         res = requests.post(url, json=payload, timeout=20)
-        print(f"PushPlus Status Code: {res.status_code}")
-        print(f"PushPlus Response: {res.text}")
-
-        try:
-            result = res.json()
-        except Exception:
-            print("❌ PushPlus 返回不是 JSON")
-            return False
-
+        result = res.json()
         if result.get("code") == 200:
-            print("✅ PushPlus 返回 code=200，推送成功")
+            print("✅ 推送成功")
             return True
         else:
-            print(f"❌ PushPlus 推送失败：code={result.get('code')}，msg={result.get('msg')}，data={result.get('data')}")
+            print(f"❌ 推送失败：{result}")
             return False
     except Exception as e:
-        print(f"❌ 推送发送失败: {e}")
+        print(f"❌ 网络异常，推送失败: {e}")
         return False
 
 
@@ -416,23 +402,17 @@ def main():
     print("🚀 开始分析全球市场情绪...")
 
     tasks = [
-        {"name": "US 美股", "getter": get_us_data, "ticker": "^GSPC", "period_type": "交易日", "link": None},
+        {"name": "US 美股", "getter": get_us_data, "ticker": None, "period_type": "交易日", "link": None},
         {"name": "₿ 比特币", "getter": get_crypto_data, "ticker": None, "period_type": "自然日", "link": None},
-        {"name": "CN A股", "getter": get_cn_data, "ticker": ASHARE_CODE, "period_type": "交易日", "link": JIUQUAN_URL},
+        {"name": "CN A股", "getter": get_cn_data, "ticker": None, "period_type": "交易日", "link": JIUQUAN_URL},
     ]
 
     results = []
     title_parts = []
 
     for task in tasks:
-        print(f"\n========== {task['name']} ==========")
         raw_data, source = task["getter"]()
-        if raw_data:
-            print(f"{task['name']} 原始数据条数：{len(raw_data)}")
-
-        if task["ticker"]:
-            raw_data = filter_by_trading_days(raw_data, task["ticker"])
-
+        # US/CN 已经在函数内处理了交易日，比特币为自然日，无需调用 filter_by_trading_days
         stats = calc_stats(raw_data, task["period_type"])
         results.append({
             "name": task["name"],
@@ -441,24 +421,18 @@ def main():
             "history": raw_data or [],
             "link": task["link"]
         })
-
         if stats:
             title_parts.append(f"{task['name'].split()[-1]}:{stats['val']}")
-            print(f"{task['name']} 当前值：{stats['val']}，近30个{task['period_type']}贪婪次数：{stats['h30']}，恐慌次数：{stats['l30']}")
 
     beijing_time = datetime.now(timezone.utc) + timedelta(hours=8)
     beijing_time_str = beijing_time.strftime("%Y-%m-%d %H:%M") + "（北京时间）"
 
     html_content = build_html(results, beijing_time_str, compact=False)
 
-    # 如果内容仍然过长，自动切换成极简明细，防止 PushPlus 拒收
     if len(html_content) > MAX_PUSHPLUS_LEN:
-        print(f"⚠️ HTML 长度 {len(html_content)} 超过安全阈值，切换为极简明细版本")
         html_content = build_html(results, beijing_time_str, compact=True)
 
-    # 如果极简版仍超限，就只推送摘要，避免任务白跑
     if len(html_content) > MAX_PUSHPLUS_LEN:
-        print(f"⚠️ 极简版仍过长：{len(html_content)}，改为只发送摘要")
         summary_lines = []
         for r in results:
             s = r["stats"]
@@ -472,7 +446,7 @@ def main():
         title = beijing_time.strftime("%m-%d") + " | " + " | ".join(title_parts)
         send_push(title, html_content)
     else:
-        print("❌ 所有数据获取失败，未发送推送")
+        print("❌ 所有数据获取失败")
 
 
 if __name__ == "__main__":
