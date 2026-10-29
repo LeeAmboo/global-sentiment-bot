@@ -4,4 +4,3 @@ akshare
 pandas
 numpy
 fear-greed
-pycryptodome
