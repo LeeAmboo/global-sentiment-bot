@@ -11,9 +11,18 @@ import numpy as np
 import fear_greed
 from datetime import datetime, timedelta, timezone
 
+try:
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import unpad
+except ImportError:
+    AES = None
+    unpad = None
+
 # ================= 配置区域 =================
 CRYPTO_URL = "https://api.alternative.me/fng/?limit=80"
-JIUQUAN_URL = "https://funddb.cn/tool/fear"
+JIUQUAN_URL = "https://www.jiucaishuo.com/indicators?tab=fg"
+JIUCAI_FG_API = "https://api.jiucaishuo.com/v2/kjtl/history-lines"
+JIUCAI_REFERER = "https://app.jiucaishuo.com/pagesE/tool/fear_greed"
 
 US_FALLBACK_URL = "https://feargreedchart.com/api/?action=all"
 US_HISTORY_URL = "https://feargreedchart.com/api/?action=history"
@@ -611,71 +620,134 @@ def build_cn_history_record(result):
     }
 
 
-def get_cn_data():
-    """计算当天 A 股五维综合指数，并保存历史；曲线只使用已保存的五维分数。"""
-    print("🇨🇳 正在计算 A 股自建贪恐指数...")
+def _parse_jiucai_date(value):
+    """解析韭圈儿接口中的日期字段，兼容日期字符串和 Unix 时间戳。"""
+    if value is None:
+        raise ValueError("韭圈儿记录缺少日期")
+    if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip().isdigit()):
+        number = float(value)
+        # 13 位通常为毫秒时间戳，10 位通常为秒时间戳。
+        if number > 1e12:
+            number /= 1000.0
+        if number > 1e9:
+            return datetime.fromtimestamp(number, tz=timezone.utc).strftime("%Y-%m-%d")
+    return normalize_date(value)
+
+
+def _decode_jiucai_response(response_text):
+    """解码韭圈儿历史接口：优先解析明文 JSON，必要时按 AES-256-CBC 解密。"""
+    text = (response_text or "").strip()
+    if not text:
+        raise ValueError("韭圈儿接口返回空内容")
+
+    # 先尝试直接 JSON；部分接口版本可能返回明文 JSON。
     try:
-        stock_df, stock_source = get_cn_stock_spot()
-        index_df, index_source = get_cn_index_history()
-        result = calculate_cn_current_factors(stock_df, index_df)
+        parsed = json.loads(text)
+        if isinstance(parsed, (list, dict)):
+            return parsed
+        if isinstance(parsed, str):
+            text = parsed.strip()
+    except Exception:
+        pass
 
-        history = load_cn_saved_history()
-        # 兼容并过滤历史文件：只保留五维综合指数记录，排除旧版代理分数/RSI。
+    if AES is None or unpad is None:
+        raise RuntimeError("缺少 pycryptodome 依赖，请在 requirements.txt 中添加 pycryptodome")
+
+    # 当前公开资料记录的韭圈儿网页端 AES 参数；网站改版时可能变化。
+    key = ("bieyanjiulexixishuibatoufamei" + "ll1").encode("utf-8")[:32]
+    iv = ("nengnongchulainb" + "ll1").encode("utf-8")[:16]
+    encrypted = base64.b64decode(text)
+    decrypted = AES.new(key, AES.MODE_CBC, iv).decrypt(encrypted)
+    decrypted = unpad(decrypted, AES.block_size)
+    return json.loads(decrypted.decode("utf-8", errors="replace"))
+
+
+def fetch_jiucai_fear_greed():
+    """获取韭圈儿恐贪指数及历史记录，返回按日期从新到旧排序的标准记录。"""
+    print("🇨🇳 正在尝试获取韭圈儿官方展示的恐贪指数...")
+    headers = {
+        **REQUEST_HEADERS,
+        "Referer": JIUCAI_REFERER,
+        "Origin": "https://app.jiucaishuo.com",
+        "Accept": "application/json, text/plain, */*",
+    }
+    response = requests.get(JIUCAI_FG_API, headers=headers, timeout=25)
+    response.raise_for_status()
+    payload = _decode_jiucai_response(response.text)
+
+    # 兼容接口可能出现的列表、data/history/lines 包装结构。
+    records_raw = payload
+    if isinstance(payload, dict):
+        for key in ("data", "history", "lines", "result", "list"):
+            if isinstance(payload.get(key), list):
+                records_raw = payload[key]
+                break
+        else:
+            raise ValueError(f"无法识别韭圈儿接口数据结构，字段：{list(payload.keys())[:20]}")
+
+    if not isinstance(records_raw, list) or not records_raw:
+        raise ValueError("韭圈儿接口没有返回有效历史记录")
+
+    records = []
+    for item in records_raw:
+        if not isinstance(item, dict):
+            continue
+        date_value = item.get("date", item.get("trade_date", item.get("timestamp", item.get("time"))))
+        score_value = item.get("value", item.get("score", item.get("fear_greed", item.get("fearGreed"))))
+        if date_value is None or score_value is None:
+            continue
+        try:
+            records.append({
+                "date": _parse_jiucai_date(date_value),
+                "value": normalize_score(score_value),
+                "method": "jiucai_official",
+            })
+        except Exception:
+            continue
+
+    if not records:
+        sample = str(records_raw[0])[:300]
+        raise ValueError(f"韭圈儿数据中未找到可识别的日期/分数，样例：{sample}")
+
+    records = dedupe_by_date(sorted(records, key=lambda x: x["date"], reverse=True))
+    print(f"✅ 韭圈儿恐贪指数获取成功：最新值 {records[0]['value']}，日期 {records[0]['date']}，历史 {len(records)} 条")
+    return records
+
+
+def get_cn_data():
+    """优先使用韭圈儿恐贪指数；保存官方历史记录，失败时读取此前保存的韭圈儿历史。"""
+    try:
+        records = fetch_jiucai_fear_greed()
+        # 只保留韭圈儿同一口径数据，避免和旧版自建五维指数混合。
         valid_history = []
-        for item in history:
-            try:
-                if item.get("method") != "five_factor_composite":
-                    continue
-                date = normalize_date(item["date"])
-                value = normalize_score(item["value"])
-                valid_history.append({**item, "date": date, "value": value})
-            except Exception:
-                continue
-
-        current_record = build_cn_history_record(result)
-        # 同一天重复运行时覆盖当天记录，避免重复日期。
-        valid_history = [r for r in valid_history if r["date"] != current_record["date"]]
-        valid_history.append(current_record)
-        valid_history = dedupe_by_date(sorted(valid_history, key=lambda x: x["date"], reverse=True))
-        valid_history = valid_history[:365]
+        for item in records:
+            valid_history.append({
+                "date": item["date"],
+                "value": item["value"],
+                "method": "jiucai_official",
+            })
+        valid_history = dedupe_by_date(
+            sorted(valid_history, key=lambda x: x["date"], reverse=True)
+        )[:365]
         save_cn_history(valid_history)
-
-        # 曲线和统计均基于保存的真实五维综合指数，最多展示最近30个交易日。
-        records = [
+        display_records = [
             {"date": item["date"], "value": item["value"]}
             for item in valid_history[:CN_DISPLAY_DAYS]
         ]
+        print(f"📉 韭圈儿历史曲线：展示最近 {len(display_records)} 条记录（最多30条）。")
+        if display_records:
+            print(f"📌 最新可用日期为 {display_records[0]['date']}；若早于今天，说明韭圈儿尚未发布更新数据。")
+        return display_records, "韭圈儿恐贪指数（官方页面数据接口）"
 
-        print(
-            f"✅ A股五维综合指数：{result['score']}，日期：{result['date']}，"
-            f"有效股票数：{result['stock_count']}"
-        )
-        print(
-            f"📊 上涨 {result['advancers']} 只，下跌 {result['decliners']} 只，"
-            f"平盘 {result['unchanged']} 只"
-        )
-        print(
-            "📈 五维分数："
-            f"趋势 {result['factors']['trend']:.1f}；"
-            f"宽度 {result['factors']['breadth']:.1f}；"
-            f"赚钱效应 {result['factors']['money']:.1f}；"
-            f"波动风险 {result['factors']['volatility']:.1f}；"
-            f"成交活跃度 {result['factors']['turnover']:.1f}"
-        )
-        print(f"📉 当前已累计 {len(records)} 条五维综合指数历史记录（最多展示最近30条）。")
-        if len(records) < 30:
-            print("ℹ️ 五维历史数据将从本次运行开始逐日积累；历史不足30个交易日时，只显示已保存的记录，不再用代理指标补齐。")
-        source = f"A股五维综合指数（{stock_source}；{index_source}）"
-        return records, source
     except Exception as e:
-        print(f"❌ A股五维综合指数计算或保存失败：{e}")
-        # 当天行情失败时，仍展示已经保存的五维历史；绝不把 RSI 或代理分数混入五维曲线。
+        print(f"⚠️ 韭圈儿恐贪指数获取失败：{e}")
+        print("🔄 尝试读取此前保存的韭圈儿历史记录...")
         try:
             history = load_cn_saved_history()
             valid_history = []
             for item in history:
                 try:
-                    if item.get("method") != "five_factor_composite":
+                    if item.get("method") != "jiucai_official":
                         continue
                     valid_history.append({
                         "date": normalize_date(item["date"]),
@@ -687,12 +759,13 @@ def get_cn_data():
                 sorted(valid_history, key=lambda x: x["date"], reverse=True)
             )[:CN_DISPLAY_DAYS]
             if valid_history:
-                print("⚠️ 当天更新失败，改为展示已保存的五维综合指数历史；未混入其他口径的数据。")
-                return valid_history, "A股五维综合指数（当天更新失败，显示已保存历史）"
+                print(f"⚠️ 当前接口不可用，改为展示已保存的韭圈儿历史，共 {len(valid_history)} 条。")
+                return valid_history, "韭圈儿恐贪指数（接口失败，使用已保存历史）"
         except Exception as history_error:
-            print(f"⚠️ 读取已保存五维历史失败：{history_error}")
-        print("❌ 当天五维指数计算失败，且没有可用的五维历史记录；为避免口径混杂，不使用 RSI 代替历史曲线。")
-        return None, "获取失败（暂无可用五维历史）"
+            print(f"⚠️ 读取韭圈儿历史记录失败：{history_error}")
+
+        print("❌ 当前无法获取韭圈儿指数，且没有可用的已保存历史。")
+        return None, "获取失败（韭圈儿接口不可用）"
 
 
 # ================= 统计计算 =================
