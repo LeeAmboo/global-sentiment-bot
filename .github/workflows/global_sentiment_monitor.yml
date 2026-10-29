@@ -1,14 +1,17 @@
 name: Global Sentiment Monitor
 
 on:
-  # 1. 定时触发：北京时间 6:30 运行
-  # GitHub Actions 使用 UTC 时间
+  # 定时触发：北京时间每天 6:30 运行
   # 北京时间 6:30 = UTC 前一天 22:30
   schedule:
     - cron: '30 22 * * *'
 
-  # 2. 手动触发：允许点击 Run workflow
+  # 手动触发：允许点击 Run workflow
   workflow_dispatch:
+
+# 允许程序将每日 A 股情绪历史数据写回仓库
+permissions:
+  contents: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -35,8 +38,6 @@ jobs:
         with:
           python-version: '3.10'
 
-      # ！！！这里的代码已修改！！！
-      # 增加了 --upgrade 参数，强制云端拉取最新版本的依赖，避免缓存导致 API 依然报错
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -50,11 +51,12 @@ jobs:
           test -f requirements.txt
           echo "Python 版本："
           python --version
-        
+
       - name: Run Monitor Script
         env:
-         PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-         PUSHPLUS_TOPIC: GFI_Strategy
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          PUSHPLUS_TOPIC: GFI_Strategy
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Starting monitor script..."
           python main.py
