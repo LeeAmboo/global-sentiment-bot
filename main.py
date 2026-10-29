@@ -12,6 +12,11 @@ from datetime import datetime, timedelta, timezone
 CRYPTO_URL = "https://api.alternative.me/fng/?limit=80"
 JIUQUAN_URL = "https://funddb.cn/tool/fear"
 
+# A股开源贪恐指数数据源
+CN_FG_BASE_URL = "https://qjr1997.github.io/fear-greed-index"
+CN_FG_URL = f"{CN_FG_BASE_URL}/data.json"
+CN_FG_FULL_URL = f"{CN_FG_BASE_URL}/data_full.json"
+
 # 备用美股贪恐指数 API
 US_FALLBACK_URL = "https://feargreedchart.com/api/?action=all"
 US_HISTORY_URL = "https://feargreedchart.com/api/?action=history"
@@ -22,8 +27,19 @@ DANGER_DAYS_THRESHOLD = 10
 MAX_PUSHPLUS_LEN = 19000
 
 FEAR_COLOR = "#16a34a"          # 恐慌：绿色
-GREED_COLOR = "#dc2626"         # 贪婪：红色
-NEUTRAL_COLOR = "#555555"       # 中性：深灰
+GREED_COLOR = "#dc2626"          # 贪婪：红色
+NEUTRAL_COLOR = "#555555"        # 中性：深灰
+
+# 通用 HTTP 请求头
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 "
+        "(Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    )
+}
 
 
 # ================= 通用工具 =================
@@ -115,12 +131,25 @@ def normalize_date(value):
     return pd.to_datetime(text).strftime("%Y-%m-%d")
 
 
+def request_json(url, timeout=20):
+    """获取 JSON 数据，并检查 HTTP 状态码。"""
+    response = requests.get(
+        url,
+        headers=REQUEST_HEADERS,
+        timeout=timeout
+    )
+
+    response.raise_for_status()
+
+    return response.json()
+
+
 # ================= 备用 RSI 计算 =================
 def calculate_rsi_history(ticker, period="8mo"):
     """
     计算指定指数的 RSI 历史数据。
     仅供 A 股原有降级逻辑使用。
-    美股不再使用 RSI 代替贪恐指数。
+    美股不使用 RSI 代替贪恐指数。
     """
     try:
         df = yf.download(
@@ -166,14 +195,8 @@ def get_cnn_us_data():
     """
     第一优先级：CNN Fear & Greed Index。
 
-    获取内容：
-    1. CNN 当前贪恐指数；
-    2. CNN 历史贪恐指数；
-    3. 统一转换为原程序使用的 date/value 数据结构。
-
-    注意：
-    CNN 当前指数和历史指数均来自 CNN，
-    不使用标普500 RSI 拼接历史曲线。
+    获取 CNN 当前指数和历史指数，
+    统一转换为 date/value 数据结构。
     """
 
     print("🇺🇸 正在获取 CNN Fear & Greed Index...")
@@ -191,13 +214,12 @@ def get_cnn_us_data():
 
     current_val = normalize_score(idx["score"])
 
-    # 优先使用 CNN 返回的时间戳确定当前日期
     if idx.get("timestamp"):
         current_date = normalize_date(idx["timestamp"])
     else:
-        current_date = datetime.now(timezone.utc).strftime(
-            "%Y-%m-%d"
-        )
+        current_date = datetime.now(
+            timezone.utc
+        ).strftime("%Y-%m-%d")
 
     print(
         f"✅ CNN 当前指数：{current_val}，"
@@ -205,16 +227,13 @@ def get_cnn_us_data():
         f"情绪：{idx.get('rating', '未知')}"
     )
 
-    # 2. 获取 CNN 自身的历史指数
+    # 2. 获取 CNN 自身历史数据
     history_records = []
 
     try:
-        # 获取最近约 120 个自然日的数据，
-        # 通常足够覆盖约 70 个美股交易日。
         raw_history = fear_greed.get_history(last="120d")
 
         for item in raw_history:
-            # 兼容对象和字典两种返回格式
             if isinstance(item, dict):
                 date_value = item.get("date")
                 score_value = item.get(
@@ -238,25 +257,21 @@ def get_cnn_us_data():
             })
 
     except Exception as e:
-        # 当前指数已成功获取时，历史数据失败不影响当前值。
         print(f"⚠️ CNN 历史数据获取失败：{e}")
 
-    # 3. 插入当前值，确保当前显示的指数与最新 API 数据一致
+    # 3. 插入最新当前值，确保优先保留当前指数
     history_records.insert(0, {
         "date": current_date,
         "value": current_val
     })
 
-    # 去重，优先保留刚刚获取的当前值
     history_records = dedupe_by_date(history_records)
 
-    # 按日期从新到旧排序
     history_records.sort(
         key=lambda x: x["date"],
         reverse=True
     )
 
-    # 最多保留最近 70 条记录
     history_records = history_records[:70]
 
     if not history_records:
@@ -270,26 +285,12 @@ def get_feargreedchart_us_data():
     """
     第二优先级：FearGreedChart API。
 
-    当前指数：
-        data["score"]["score"]
-
-    历史指数：
-        优先使用 action=all 返回的 recent；
-        若没有有效历史记录，则请求 action=history。
-
-    不使用 RSI 作为备用贪恐指数。
+    不使用 RSI 作为美股贪恐指数替代。
     """
 
     print("🔄 正在切换到 FearGreedChart API...")
 
-    response = requests.get(
-        US_FALLBACK_URL,
-        timeout=20
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
+    data = request_json(US_FALLBACK_URL)
 
     # 1. 解析当前指数
     score_info = data.get("score")
@@ -306,12 +307,11 @@ def get_feargreedchart_us_data():
 
     current_val = normalize_score(score_info["score"])
 
-    # 2. 获取日期
-    current_date = datetime.now(timezone.utc).strftime(
-        "%Y-%m-%d"
-    )
+    # 2. 解析当前日期
+    current_date = datetime.now(
+        timezone.utc
+    ).strftime("%Y-%m-%d")
 
-    # 优先使用服务器时间戳
     if data.get("ts") is not None:
         try:
             current_date = datetime.fromtimestamp(
@@ -326,73 +326,74 @@ def get_feargreedchart_us_data():
         f"日期：{current_date}"
     )
 
-    # 3. 解析历史数据
+    # 3. 获取历史数据
     history_records = []
 
-    # 优先使用 action=all 返回的 recent 字段
     raw_history = data.get("recent")
 
     if not isinstance(raw_history, list):
         raw_history = []
 
-    # 兼容可能存在的 history 字段
     if not raw_history:
         candidate = data.get("history")
 
         if isinstance(candidate, list):
             raw_history = candidate
 
-    for item in raw_history:
-        if not isinstance(item, dict):
-            continue
+    def parse_history_items(items):
+        records = []
 
-        date_value = item.get(
-            "date",
-            item.get("timestamp")
-        )
+        for item in items:
+            if not isinstance(item, dict):
+                continue
 
-        score_value = item.get(
-            "score",
-            item.get("value")
-        )
+            date_value = item.get(
+                "date",
+                item.get("timestamp")
+            )
 
-        if date_value is None or score_value is None:
-            continue
+            score_value = item.get(
+                "score",
+                item.get("value")
+            )
 
-        try:
-            # 时间戳可能是秒，也可能是毫秒
-            if isinstance(date_value, (int, float)):
-                timestamp = float(date_value)
+            if date_value is None or score_value is None:
+                continue
 
-                if timestamp > 1e12:
-                    timestamp /= 1000
+            try:
+                if isinstance(date_value, (int, float)):
+                    timestamp = float(date_value)
 
-                date_value = datetime.fromtimestamp(
-                    timestamp,
-                    tz=timezone.utc
-                )
+                    if timestamp > 1e12:
+                        timestamp /= 1000
 
-            history_records.append({
-                "date": normalize_date(date_value),
-                "value": normalize_score(score_value)
-            })
+                    date_value = datetime.fromtimestamp(
+                        timestamp,
+                        tz=timezone.utc
+                    )
 
-        except (ValueError, TypeError, OverflowError, OSError):
-            continue
+                records.append({
+                    "date": normalize_date(date_value),
+                    "value": normalize_score(score_value)
+                })
+
+            except (
+                ValueError,
+                TypeError,
+                OverflowError,
+                OSError
+            ):
+                continue
+
+        return records
+
+    history_records = parse_history_items(raw_history)
 
     # 4. 如果 action=all 没有提供有效历史数据，尝试独立历史接口
     if not history_records:
         try:
-            history_response = requests.get(
-                US_HISTORY_URL,
-                timeout=20
-            )
+            history_data = request_json(US_HISTORY_URL)
 
-            history_response.raise_for_status()
-
-            history_data = history_response.json()
-
-            # 兼容列表和字典形式的 JSON
             if isinstance(history_data, list):
                 raw_history = history_data
 
@@ -411,60 +412,19 @@ def get_feargreedchart_us_data():
             else:
                 raw_history = []
 
-            for item in raw_history:
-                if not isinstance(item, dict):
-                    continue
-
-                date_value = item.get(
-                    "date",
-                    item.get("timestamp")
-                )
-
-                score_value = item.get(
-                    "score",
-                    item.get("value")
-                )
-
-                if date_value is None or score_value is None:
-                    continue
-
-                try:
-                    if isinstance(date_value, (int, float)):
-                        timestamp = float(date_value)
-
-                        if timestamp > 1e12:
-                            timestamp /= 1000
-
-                        date_value = datetime.fromtimestamp(
-                            timestamp,
-                            tz=timezone.utc
-                        )
-
-                    history_records.append({
-                        "date": normalize_date(date_value),
-                        "value": normalize_score(score_value)
-                    })
-
-                except (
-                    ValueError,
-                    TypeError,
-                    OverflowError,
-                    OSError
-                ):
-                    continue
+            history_records = parse_history_items(raw_history)
 
         except Exception as e:
             print(
                 f"⚠️ FearGreedChart 历史接口获取失败：{e}"
             )
 
-    # 5. 插入最新当前值
+    # 5. 插入当前值
     history_records.insert(0, {
         "date": current_date,
         "value": current_val
     })
 
-    # 去重：优先保留当前接口刚刚返回的指数
     history_records = dedupe_by_date(history_records)
 
     history_records.sort(
@@ -482,19 +442,17 @@ def get_feargreedchart_us_data():
     return history_records
 
 
-# ================= 三类数据获取 =================
+# ================= 美股数据获取 =================
 def get_us_data():
     """
     美股指数获取优先级：
+    1. CNN Fear & Greed Index
+    2. FearGreedChart API
 
-    第一优先级：CNN Fear & Greed Index
-    第二优先级：FearGreedChart API
-
-    两种指数均获取失败时，返回获取失败。
-    不使用标普500 RSI 作为美股贪恐指数替代。
+    两者均失败时，返回获取失败。
+    不使用标普500 RSI 替代美股贪恐指数。
     """
 
-    # 第一优先级：CNN
     try:
         data = get_cnn_us_data()
 
@@ -503,36 +461,30 @@ def get_us_data():
         return data, "CNN Fear & Greed Index"
 
     except Exception as e:
-        print(
-            f"⚠️ CNN 贪恐指数获取失败：{e}"
-        )
+        print(f"⚠️ CNN 贪恐指数获取失败：{e}")
 
-    # 第二优先级：FearGreedChart
     try:
         data = get_feargreedchart_us_data()
 
-        print(
-            "✅ 美股数据来源：FearGreedChart API"
-        )
+        print("✅ 美股数据来源：FearGreedChart API")
 
         return data, "FearGreedChart API"
 
     except Exception as e:
-        print(
-            f"❌ FearGreedChart 获取失败：{e}"
-        )
+        print(f"❌ FearGreedChart 获取失败：{e}")
 
-    # 两个来源均失败
     print("❌ CNN 与 FearGreedChart 均获取失败")
 
     return None, "获取失败"
 
 
+# ================= 比特币贪恐指数 =================
 def get_crypto_data():
     """比特币：Alternative.me"""
     try:
         res = requests.get(
             CRYPTO_URL,
+            headers=REQUEST_HEADERS,
             timeout=15
         )
 
@@ -548,10 +500,17 @@ def get_crypto_data():
                     int(d["timestamp"]),
                     tz=timezone.utc
                 ).strftime("%Y-%m-%d"),
-                "value": int(d["value"])
+                "value": normalize_score(d["value"])
             })
 
-        return dedupe_by_date(data), "Alternative.me"
+        data = dedupe_by_date(data)
+
+        data.sort(
+            key=lambda x: x["date"],
+            reverse=True
+        )
+
+        return data, "Alternative.me"
 
     except Exception as e:
         print(f"Crypto API Failed: {e}")
@@ -559,139 +518,309 @@ def get_crypto_data():
         return None, "获取失败"
 
 
-def get_cn_data():
+# ================= A股开源贪恐指数 =================
+def extract_cn_fg_records(raw):
     """
-    A股：新浪源。
+    解析 qjr1997/fear-greed-index 的 JSON 数据。
 
-    因子：
-    RSI (40%) + 125日市场动量 (30%) + 30日成交量情绪 (30%)
+    兼容以下常见形式：
+    1. 列表：
+       [{"date": "2026-10-28", "value": 40}, ...]
+
+    2. 字典中包含数据列表：
+       {"data": [...]}
+       {"history": [...]}
+       {"records": [...]}
+       {"items": [...]}
+
+    3. 字典中以日期作为键：
+       {"2026-10-28": 40, "2026-10-27": 45}
+
+    4. 常见字段别名：
+       日期：date / day / trade_date / timestamp
+       指数：value / score / index / fear_greed_index
+
+    如果项目实际返回的字段名称不同，可根据打印的 JSON
+    结构补充对应字段。
     """
 
-    try:
-        # 1. 抓取沪深300历史日线
-        hs300 = ak.stock_zh_index_daily(
-            symbol="sh000300"
-        )
+    date_keys = [
+        "date",
+        "day",
+        "trade_date",
+        "datetime",
+        "timestamp"
+    ]
 
-        # 统一列名
-        hs300.columns = [
-            col.lower()
-            for col in hs300.columns
-        ]
+    score_keys = [
+        "value",
+        "score",
+        "index",
+        "fear_greed_index",
+        "fear_greed",
+        "fg_index",
+        "afgi"
+    ]
 
-        # 数据预处理
-        hs300["date"] = pd.to_datetime(
-            hs300["date"]
-        )
+    def get_field(item, keys):
+        for key in keys:
+            if key in item and item[key] is not None:
+                return item[key]
 
-        hs300.set_index(
-            "date",
-            inplace=True
-        )
+        return None
 
-        hs300["close"] = pd.to_numeric(
-            hs300["close"]
-        )
+    def parse_item(item):
+        if not isinstance(item, dict):
+            return None
 
-        hs300["volume"] = pd.to_numeric(
-            hs300["volume"]
-        )
+        date_value = get_field(item, date_keys)
+        score_value = get_field(item, score_keys)
 
-        # 2. 计算 RSI
-        delta = hs300["close"].diff()
+        # 兼容嵌套的 score 对象
+        if isinstance(score_value, dict):
+            score_value = score_value.get(
+                "value",
+                score_value.get("score")
+            )
 
-        gain = delta.clip(
-            lower=0
-        ).rolling(14).mean()
+        if date_value is None or score_value is None:
+            return None
 
-        loss = -delta.clip(
-            upper=0
-        ).rolling(14).mean()
+        try:
+            # 兼容 Unix 秒级、毫秒级时间戳
+            if isinstance(date_value, (int, float)):
+                timestamp = float(date_value)
 
-        rs = gain / loss
+                if timestamp > 1e12:
+                    timestamp /= 1000
 
-        hs300["RSI"] = 100 - (
-            100 / (1 + rs)
-        )
+                date_value = datetime.fromtimestamp(
+                    timestamp,
+                    tz=timezone.utc
+                )
 
-        # 3. 市场动量：125日均线乖离率
-        hs300["MA125"] = hs300[
-            "close"
-        ].rolling(
-            window=125
-        ).mean()
+            record = {
+                "date": normalize_date(date_value),
+                "value": normalize_score(score_value)
+            }
 
-        hs300["BIAS"] = (
-            (
-                hs300["close"] -
-                hs300["MA125"]
-            ) /
-            hs300["MA125"]
-        ) * 100
+            return record
 
-        # BIAS 限定在 [-15%, +15%]，映射到 [0, 100]
-        hs300["Momentum_Score"] = np.clip(
-            (hs300["BIAS"] + 15) / 30 * 100,
-            0,
-            100
-        )
+        except (
+            ValueError,
+            TypeError,
+            OverflowError,
+            OSError
+        ):
+            return None
 
-        # 4. 成交量情绪：当前成交量 / 30日均量
-        hs300["Vol_MA30"] = hs300[
-            "volume"
-        ].rolling(
-            window=30
-        ).mean()
-
-        hs300["Vol_Ratio"] = (
-            hs300["volume"] /
-            hs300["Vol_MA30"]
-        )
-
-        # 均量的 0.5 倍到 1.5 倍映射到 [0, 100]
-        hs300["Volume_Score"] = np.clip(
-            (hs300["Vol_Ratio"] - 0.5) /
-            1.0 * 100,
-            0,
-            100
-        )
-
-        # 5. 综合情绪指数
-        hs300["Fear_Greed_Score"] = (
-            hs300["RSI"] * 0.4 +
-            hs300["Momentum_Score"] * 0.3 +
-            hs300["Volume_Score"] * 0.3
-        )
-
-        # 提取最近 70 个有效交易日
-        recent_data = hs300.dropna().iloc[-70:].copy()
-
+    # 1. 原始数据本身是列表
+    if isinstance(raw, list):
         records = []
 
-        for date, row in recent_data.iloc[::-1].iterrows():
-            records.append({
-                "date": date.strftime("%Y-%m-%d"),
-                "value": normalize_score(
-                    row["Fear_Greed_Score"]
+        for item in raw:
+            record = parse_item(item)
+
+            if record:
+                records.append(record)
+
+        return records
+
+    # 2. 原始数据是字典
+    if isinstance(raw, dict):
+
+        # 先尝试识别当前指数及历史数据的常见容器字段
+        for key in [
+            "data",
+            "history",
+            "records",
+            "items",
+            "results",
+            "daily",
+            "values"
+        ]:
+            candidate = raw.get(key)
+
+            if isinstance(candidate, list):
+                records = extract_cn_fg_records(candidate)
+
+                if records:
+                    return records
+
+            elif isinstance(candidate, dict):
+                records = extract_cn_fg_records(candidate)
+
+                if records:
+                    return records
+
+        # 兼容 {"date": [...], "value": [...]} 形式
+        date_array = raw.get("date")
+
+        if not isinstance(date_array, list):
+            date_array = raw.get("dates")
+
+        value_array = raw.get("value")
+
+        if not isinstance(value_array, list):
+            value_array = raw.get("values")
+
+        if (
+            isinstance(date_array, list)
+            and isinstance(value_array, list)
+            and len(date_array) == len(value_array)
+        ):
+            records = []
+
+            for date_value, score_value in zip(
+                date_array,
+                value_array
+            ):
+                record = parse_item({
+                    "date": date_value,
+                    "value": score_value
+                })
+
+                if record:
+                    records.append(record)
+
+            if records:
+                return records
+
+        # 尝试解析单条记录
+        record = parse_item(raw)
+
+        if record:
+            return [record]
+
+        # 兼容日期作为键的结构
+        records = []
+
+        for key, value in raw.items():
+            try:
+                date_value = normalize_date(key)
+
+                if isinstance(value, dict):
+                    score_value = get_field(
+                        value,
+                        score_keys
+                    )
+                else:
+                    score_value = value
+
+                if isinstance(score_value, dict):
+                    score_value = score_value.get(
+                        "value",
+                        score_value.get("score")
+                    )
+
+                if score_value is None:
+                    continue
+
+                records.append({
+                    "date": date_value,
+                    "value": normalize_score(score_value)
+                })
+
+            except (
+                ValueError,
+                TypeError,
+                OverflowError
+            ):
+                continue
+
+        return records
+
+    raise ValueError(
+        f"A股贪恐指数 JSON 类型不支持：{type(raw).__name__}"
+    )
+
+
+def get_cn_data():
+    """
+    A股：qjr1997/fear-greed-index 开源贪恐指数。
+
+    优先获取近期数据 data.json；
+    若无法获取或解析有效数据，则尝试 data_full.json。
+
+    成功后统一返回：
+        [
+            {"date": "YYYY-MM-DD", "value": 0～100},
+            ...
+        ]
+
+    仅当开源指数数据源不可用时，
+    才降级使用原有沪深300 RSI 计算。
+    """
+
+    print("🇨🇳 正在获取 A股开源贪恐指数...")
+
+    urls = [
+        (CN_FG_URL, "开源贪恐指数 data.json"),
+        (CN_FG_FULL_URL, "开源贪恐指数 data_full.json")
+    ]
+
+    last_error = None
+
+    for url, source_name in urls:
+        try:
+            print(f"🔄 正在请求：{url}")
+
+            raw = request_json(
+                url,
+                timeout=20
+            )
+
+            records = extract_cn_fg_records(raw)
+
+            # 去重、排序
+            records = dedupe_by_date(records)
+
+            records.sort(
+                key=lambda x: x["date"],
+                reverse=True
+            )
+
+            if not records:
+                raise ValueError(
+                    "JSON 中没有解析到有效日期和指数分数"
                 )
-            })
 
-        if not records:
-            raise ValueError("沪深300未产生有效情绪数据")
+            # 限制为最近 70 条记录，满足现有报告展示逻辑
+            records = records[:70]
 
-        return (
-            dedupe_by_date(records),
-            "AkShare 多因子模型 (新浪源)"
-        )
+            latest = records[0]
 
-    except Exception as e:
-        print(f"A-Share Calculation Error: {e}")
+            print(
+                f"✅ A股开源贪恐指数获取成功："
+                f"{latest['value']}，"
+                f"日期：{latest['date']}，"
+                f"有效记录：{len(records)} 条"
+            )
 
-        # 保留原有 A 股 RSI 降级逻辑
-        return (
-            calculate_rsi_history("000300.SS"),
-            "沪深300 RSI (降级)"
-        )
+            return records, f"qjr1997 开源贪恐指数（{source_name}）"
+
+        except Exception as e:
+            last_error = e
+
+            print(
+                f"⚠️ {source_name} 获取或解析失败：{e}"
+            )
+
+    # 两个开源 JSON 均失败时，保留原有降级机制
+    print(
+        f"⚠️ A股开源贪恐指数不可用：{last_error}"
+    )
+
+    print("🔄 降级使用沪深300 RSI 历史数据...")
+
+    fallback_data = calculate_rsi_history("000300.SS")
+
+    if fallback_data:
+        return fallback_data, "沪深300 RSI（降级）"
+
+    print("❌ A股开源贪恐指数与 RSI 降级数据均获取失败")
+
+    return None, "获取失败"
 
 
 # ================= 统计计算 =================
