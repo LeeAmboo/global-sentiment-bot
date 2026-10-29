@@ -1,4 +1,5 @@
 import os
+import re
 import html
 import requests
 import yfinance as yf
@@ -7,15 +8,23 @@ import pandas as pd
 import numpy as np
 import fear_greed
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ================= 配置区域 =================
 CRYPTO_URL = "https://api.alternative.me/fng/?limit=80"
 JIUQUAN_URL = "https://funddb.cn/tool/fear"
 
-# A股开源贪恐指数数据源
-CN_FG_BASE_URL = "https://qjr1997.github.io/fear-greed-index"
-CN_FG_URL = f"{CN_FG_BASE_URL}/data.json"
-CN_FG_FULL_URL = f"{CN_FG_BASE_URL}/data_full.json"
+# A股贪恐指数：kaifengmayao/a-share-fear-greed-index
+CN_FG_REPO = "https://github.com/kaifengmayao/a-share-fear-greed-index"
+CN_FG_API_TREE = (
+    "https://api.github.com/repos/"
+    "kaifengmayao/a-share-fear-greed-index/git/trees/main?recursive=1"
+)
+CN_FG_RAW_BASE = (
+    "https://raw.githubusercontent.com/"
+    "kaifengmayao/a-share-fear-greed-index/main"
+)
+CN_FG_LATEST_MD = f"{CN_FG_RAW_BASE}/reports/latest.md"
 
 # 备用美股贪恐指数 API
 US_FALLBACK_URL = "https://feargreedchart.com/api/?action=all"
@@ -25,18 +34,16 @@ LIMIT_LOW = 25
 LIMIT_HIGH = 75
 DANGER_DAYS_THRESHOLD = 10
 MAX_PUSHPLUS_LEN = 19000
+CN_HISTORY_LIMIT = 70
 
-FEAR_COLOR = "#16a34a"          # 恐慌：绿色
-GREED_COLOR = "#dc2626"          # 贪婪：红色
-NEUTRAL_COLOR = "#555555"        # 中性：深灰
+FEAR_COLOR = "#16a34a"
+GREED_COLOR = "#dc2626"
+NEUTRAL_COLOR = "#555555"
 
-# 通用 HTTP 请求头
 REQUEST_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 "
-        "(Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 "
-        "(KHTML, like Gecko) "
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/131.0.0.0 Safari/537.36"
     )
 }
@@ -83,30 +90,22 @@ def dedupe_by_date(data):
     """按日期去重，保留每个日期首次出现的记录。"""
     if not data:
         return data
-
-    seen = set()
-    out = []
-
+    seen, out = set(), []
     for item in data:
         d = item.get("date")
-
         if d not in seen:
             seen.add(d)
             out.append(item)
-
     return out
 
 
 def normalize_score(value):
     """校验指数分数，确保是 0～100 之间的有效数字。"""
     score = float(value)
-
     if not np.isfinite(score):
         raise ValueError(f"指数分数不是有效数字：{value}")
-
     if not 0 <= score <= 100:
         raise ValueError(f"指数分数超出 0～100 范围：{score}")
-
     return int(round(score))
 
 
@@ -114,77 +113,56 @@ def normalize_date(value):
     """将日期统一转换为 YYYY-MM-DD。"""
     if isinstance(value, datetime):
         return value.strftime("%Y-%m-%d")
-
     if hasattr(value, "strftime"):
         return value.strftime("%Y-%m-%d")
-
     text = str(value).strip()
-
-    # 兼容 ISO 8601 时间字符串
     if "T" in text:
         text = text.split("T")[0]
-
-    # 兼容带时区的日期时间字符串
     if " " in text:
         text = text.split(" ")[0]
-
     return pd.to_datetime(text).strftime("%Y-%m-%d")
 
 
 def request_json(url, timeout=20):
-    """获取 JSON 数据，并检查 HTTP 状态码。"""
     response = requests.get(
-        url,
-        headers=REQUEST_HEADERS,
-        timeout=timeout
+        url, headers=REQUEST_HEADERS, timeout=timeout
     )
-
     response.raise_for_status()
-
     return response.json()
+
+
+def request_text(url, timeout=20):
+    response = requests.get(
+        url, headers=REQUEST_HEADERS, timeout=timeout
+    )
+    response.raise_for_status()
+    return response.text
 
 
 # ================= 备用 RSI 计算 =================
 def calculate_rsi_history(ticker, period="8mo"):
-    """
-    计算指定指数的 RSI 历史数据。
-    仅供 A 股原有降级逻辑使用。
-    美股不使用 RSI 代替贪恐指数。
-    """
+    """仅供 A 股开源指数失败时降级使用；不会把 RSI 标成贪恐指数。"""
     try:
         df = yf.download(
-            ticker,
-            period=period,
-            progress=False,
-            auto_adjust=False
+            ticker, period=period, progress=False, auto_adjust=False
         )
-
         if df.empty:
             return None
-
         close = df["Close"]
-
         if hasattr(close, "columns"):
             close = close.iloc[:, 0]
-
         delta = close.diff()
-
         gain = delta.clip(lower=0).rolling(14).mean()
         loss = -delta.clip(upper=0).rolling(14).mean()
-
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs))
-
         records = []
-
         for date, value in rsi.dropna().iloc[-70:][::-1].items():
             records.append({
                 "date": date.strftime("%Y-%m-%d"),
                 "value": normalize_score(value)
             })
-
         return records
-
     except Exception as e:
         print(f"RSI Calculation Error for {ticker}: {e}")
         return None
@@ -192,289 +170,144 @@ def calculate_rsi_history(ticker, period="8mo"):
 
 # ================= CNN 美股贪恐指数 =================
 def get_cnn_us_data():
-    """
-    第一优先级：CNN Fear & Greed Index。
-
-    获取 CNN 当前指数和历史指数，
-    统一转换为 date/value 数据结构。
-    """
-
     print("🇺🇸 正在获取 CNN Fear & Greed Index...")
-
-    # 1. 获取 CNN 当前指数
     idx = fear_greed.get()
-
     if not isinstance(idx, dict):
-        raise ValueError(
-            f"CNN 返回数据格式异常：{type(idx).__name__}"
-        )
-
+        raise ValueError(f"CNN 返回数据格式异常：{type(idx).__name__}")
     if "score" not in idx:
         raise ValueError("CNN 返回数据缺少 score 字段")
 
     current_val = normalize_score(idx["score"])
-
-    if idx.get("timestamp"):
-        current_date = normalize_date(idx["timestamp"])
-    else:
-        current_date = datetime.now(
-            timezone.utc
-        ).strftime("%Y-%m-%d")
-
+    current_date = (
+        normalize_date(idx["timestamp"])
+        if idx.get("timestamp")
+        else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    )
     print(
-        f"✅ CNN 当前指数：{current_val}，"
-        f"日期：{current_date}，"
+        f"✅ CNN 当前指数：{current_val}，日期：{current_date}，"
         f"情绪：{idx.get('rating', '未知')}"
     )
 
-    # 2. 获取 CNN 自身历史数据
     history_records = []
-
     try:
         raw_history = fear_greed.get_history(last="120d")
-
         for item in raw_history:
             if isinstance(item, dict):
                 date_value = item.get("date")
-                score_value = item.get(
-                    "score",
-                    item.get("value")
-                )
+                score_value = item.get("score", item.get("value"))
             else:
                 date_value = getattr(item, "date", None)
-                score_value = getattr(
-                    item,
-                    "score",
-                    getattr(item, "value", None)
-                )
-
+                score_value = getattr(item, "score", getattr(item, "value", None))
             if date_value is None or score_value is None:
                 continue
-
             history_records.append({
                 "date": normalize_date(date_value),
                 "value": normalize_score(score_value)
             })
-
     except Exception as e:
         print(f"⚠️ CNN 历史数据获取失败：{e}")
 
-    # 3. 插入最新当前值，确保优先保留当前指数
-    history_records.insert(0, {
-        "date": current_date,
-        "value": current_val
-    })
-
+    history_records.insert(0, {"date": current_date, "value": current_val})
     history_records = dedupe_by_date(history_records)
-
-    history_records.sort(
-        key=lambda x: x["date"],
-        reverse=True
-    )
-
+    history_records.sort(key=lambda x: x["date"], reverse=True)
     history_records = history_records[:70]
-
     if not history_records:
         raise ValueError("CNN 没有返回有效指数数据")
-
     return history_records
 
 
 # ================= FearGreedChart 备用美股指数 =================
 def get_feargreedchart_us_data():
-    """
-    第二优先级：FearGreedChart API。
-
-    不使用 RSI 作为美股贪恐指数替代。
-    """
-
     print("🔄 正在切换到 FearGreedChart API...")
-
     data = request_json(US_FALLBACK_URL)
-
-    # 1. 解析当前指数
     score_info = data.get("score")
-
     if not isinstance(score_info, dict):
-        raise ValueError(
-            "FearGreedChart 返回数据缺少 score 对象"
-        )
-
+        raise ValueError("FearGreedChart 返回数据缺少 score 对象")
     if "score" not in score_info:
-        raise ValueError(
-            "FearGreedChart 返回数据缺少 score.score 字段"
-        )
-
+        raise ValueError("FearGreedChart 返回数据缺少 score.score 字段")
     current_val = normalize_score(score_info["score"])
 
-    # 2. 解析当前日期
-    current_date = datetime.now(
-        timezone.utc
-    ).strftime("%Y-%m-%d")
-
+    current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if data.get("ts") is not None:
         try:
             current_date = datetime.fromtimestamp(
-                float(data["ts"]) / 1000,
-                tz=timezone.utc
+                float(data["ts"]) / 1000, tz=timezone.utc
             ).strftime("%Y-%m-%d")
         except (ValueError, TypeError, OSError):
             pass
-
-    print(
-        f"✅ FearGreedChart 当前指数：{current_val}，"
-        f"日期：{current_date}"
-    )
-
-    # 3. 获取历史数据
-    history_records = []
-
-    raw_history = data.get("recent")
-
-    if not isinstance(raw_history, list):
-        raw_history = []
-
-    if not raw_history:
-        candidate = data.get("history")
-
-        if isinstance(candidate, list):
-            raw_history = candidate
+    print(f"✅ FearGreedChart 当前指数：{current_val}，日期：{current_date}")
 
     def parse_history_items(items):
         records = []
-
         for item in items:
             if not isinstance(item, dict):
                 continue
-
-            date_value = item.get(
-                "date",
-                item.get("timestamp")
-            )
-
-            score_value = item.get(
-                "score",
-                item.get("value")
-            )
-
+            date_value = item.get("date", item.get("timestamp"))
+            score_value = item.get("score", item.get("value"))
             if date_value is None or score_value is None:
                 continue
-
             try:
                 if isinstance(date_value, (int, float)):
                     timestamp = float(date_value)
-
                     if timestamp > 1e12:
                         timestamp /= 1000
-
-                    date_value = datetime.fromtimestamp(
-                        timestamp,
-                        tz=timezone.utc
-                    )
-
+                    date_value = datetime.fromtimestamp(timestamp, tz=timezone.utc)
                 records.append({
                     "date": normalize_date(date_value),
                     "value": normalize_score(score_value)
                 })
-
-            except (
-                ValueError,
-                TypeError,
-                OverflowError,
-                OSError
-            ):
+            except (ValueError, TypeError, OverflowError, OSError):
                 continue
-
         return records
 
+    raw_history = data.get("recent")
+    if not isinstance(raw_history, list):
+        raw_history = []
+    if not raw_history and isinstance(data.get("history"), list):
+        raw_history = data["history"]
     history_records = parse_history_items(raw_history)
 
-    # 4. 如果 action=all 没有提供有效历史数据，尝试独立历史接口
     if not history_records:
         try:
             history_data = request_json(US_HISTORY_URL)
-
             if isinstance(history_data, list):
                 raw_history = history_data
-
             elif isinstance(history_data, dict):
                 raw_history = history_data.get(
-                    "data",
-                    history_data.get(
-                        "history",
-                        history_data.get("recent", [])
-                    )
+                    "data", history_data.get("history", history_data.get("recent", []))
                 )
-
                 if not isinstance(raw_history, list):
                     raw_history = []
-
             else:
                 raw_history = []
-
             history_records = parse_history_items(raw_history)
-
         except Exception as e:
-            print(
-                f"⚠️ FearGreedChart 历史接口获取失败：{e}"
-            )
+            print(f"⚠️ FearGreedChart 历史接口获取失败：{e}")
 
-    # 5. 插入当前值
-    history_records.insert(0, {
-        "date": current_date,
-        "value": current_val
-    })
-
+    history_records.insert(0, {"date": current_date, "value": current_val})
     history_records = dedupe_by_date(history_records)
-
-    history_records.sort(
-        key=lambda x: x["date"],
-        reverse=True
-    )
-
+    history_records.sort(key=lambda x: x["date"], reverse=True)
     history_records = history_records[:70]
-
     if not history_records:
-        raise ValueError(
-            "FearGreedChart 没有返回有效指数数据"
-        )
-
+        raise ValueError("FearGreedChart 没有返回有效指数数据")
     return history_records
 
 
-# ================= 美股数据获取 =================
 def get_us_data():
-    """
-    美股指数获取优先级：
-    1. CNN Fear & Greed Index
-    2. FearGreedChart API
-
-    两者均失败时，返回获取失败。
-    不使用标普500 RSI 替代美股贪恐指数。
-    """
-
+    """美股指数优先 CNN，其次 FearGreedChart；均失败则返回失败。"""
     try:
         data = get_cnn_us_data()
-
         print("✅ 美股数据来源：CNN Fear & Greed Index")
-
         return data, "CNN Fear & Greed Index"
-
     except Exception as e:
         print(f"⚠️ CNN 贪恐指数获取失败：{e}")
-
     try:
         data = get_feargreedchart_us_data()
-
         print("✅ 美股数据来源：FearGreedChart API")
-
         return data, "FearGreedChart API"
-
     except Exception as e:
         print(f"❌ FearGreedChart 获取失败：{e}")
-
     print("❌ CNN 与 FearGreedChart 均获取失败")
-
     return None, "获取失败"
 
 
@@ -482,344 +315,141 @@ def get_us_data():
 def get_crypto_data():
     """比特币：Alternative.me"""
     try:
-        res = requests.get(
-            CRYPTO_URL,
-            headers=REQUEST_HEADERS,
-            timeout=15
-        )
-
+        res = requests.get(CRYPTO_URL, headers=REQUEST_HEADERS, timeout=15)
         res.raise_for_status()
-
         raw = res.json()["data"]
-
         data = []
-
         for d in raw:
             data.append({
                 "date": datetime.fromtimestamp(
-                    int(d["timestamp"]),
-                    tz=timezone.utc
+                    int(d["timestamp"]), tz=timezone.utc
                 ).strftime("%Y-%m-%d"),
                 "value": normalize_score(d["value"])
             })
-
         data = dedupe_by_date(data)
-
-        data.sort(
-            key=lambda x: x["date"],
-            reverse=True
-        )
-
+        data.sort(key=lambda x: x["date"], reverse=True)
         return data, "Alternative.me"
-
     except Exception as e:
         print(f"Crypto API Failed: {e}")
-
         return None, "获取失败"
 
 
 # ================= A股开源贪恐指数 =================
-def extract_cn_fg_records(raw):
+def parse_afgi_markdown(markdown_text, fallback_date=None):
     """
-    解析 qjr1997/fear-greed-index 的 JSON 数据。
-
-    兼容以下常见形式：
-    1. 列表：
-       [{"date": "2026-10-28", "value": 40}, ...]
-
-    2. 字典中包含数据列表：
-       {"data": [...]}
-       {"history": [...]}
-       {"records": [...]}
-       {"items": [...]}
-
-    3. 字典中以日期作为键：
-       {"2026-10-28": 40, "2026-10-27": 45}
-
-    4. 常见字段别名：
-       日期：date / day / trade_date / timestamp
-       指数：value / score / index / fear_greed_index
-
-    如果项目实际返回的字段名称不同，可根据打印的 JSON
-    结构补充对应字段。
+    解析 AFGI 项目日报 Markdown 中的日期和最终指数。
+    项目报告格式示例：
+      - 日期：2026-10-16
+      - 指数：48.2 / 100
     """
-
-    date_keys = [
-        "date",
-        "day",
-        "trade_date",
-        "datetime",
-        "timestamp"
-    ]
-
-    score_keys = [
-        "value",
-        "score",
-        "index",
-        "fear_greed_index",
-        "fear_greed",
-        "fg_index",
-        "afgi"
-    ]
-
-    def get_field(item, keys):
-        for key in keys:
-            if key in item and item[key] is not None:
-                return item[key]
-
-        return None
-
-    def parse_item(item):
-        if not isinstance(item, dict):
-            return None
-
-        date_value = get_field(item, date_keys)
-        score_value = get_field(item, score_keys)
-
-        # 兼容嵌套的 score 对象
-        if isinstance(score_value, dict):
-            score_value = score_value.get(
-                "value",
-                score_value.get("score")
-            )
-
-        if date_value is None or score_value is None:
-            return None
-
-        try:
-            # 兼容 Unix 秒级、毫秒级时间戳
-            if isinstance(date_value, (int, float)):
-                timestamp = float(date_value)
-
-                if timestamp > 1e12:
-                    timestamp /= 1000
-
-                date_value = datetime.fromtimestamp(
-                    timestamp,
-                    tz=timezone.utc
-                )
-
-            record = {
-                "date": normalize_date(date_value),
-                "value": normalize_score(score_value)
-            }
-
-            return record
-
-        except (
-            ValueError,
-            TypeError,
-            OverflowError,
-            OSError
-        ):
-            return None
-
-    # 1. 原始数据本身是列表
-    if isinstance(raw, list):
-        records = []
-
-        for item in raw:
-            record = parse_item(item)
-
-            if record:
-                records.append(record)
-
-        return records
-
-    # 2. 原始数据是字典
-    if isinstance(raw, dict):
-
-        # 先尝试识别当前指数及历史数据的常见容器字段
-        for key in [
-            "data",
-            "history",
-            "records",
-            "items",
-            "results",
-            "daily",
-            "values"
-        ]:
-            candidate = raw.get(key)
-
-            if isinstance(candidate, list):
-                records = extract_cn_fg_records(candidate)
-
-                if records:
-                    return records
-
-            elif isinstance(candidate, dict):
-                records = extract_cn_fg_records(candidate)
-
-                if records:
-                    return records
-
-        # 兼容 {"date": [...], "value": [...]} 形式
-        date_array = raw.get("date")
-
-        if not isinstance(date_array, list):
-            date_array = raw.get("dates")
-
-        value_array = raw.get("value")
-
-        if not isinstance(value_array, list):
-            value_array = raw.get("values")
-
-        if (
-            isinstance(date_array, list)
-            and isinstance(value_array, list)
-            and len(date_array) == len(value_array)
-        ):
-            records = []
-
-            for date_value, score_value in zip(
-                date_array,
-                value_array
-            ):
-                record = parse_item({
-                    "date": date_value,
-                    "value": score_value
-                })
-
-                if record:
-                    records.append(record)
-
-            if records:
-                return records
-
-        # 尝试解析单条记录
-        record = parse_item(raw)
-
-        if record:
-            return [record]
-
-        # 兼容日期作为键的结构
-        records = []
-
-        for key, value in raw.items():
-            try:
-                date_value = normalize_date(key)
-
-                if isinstance(value, dict):
-                    score_value = get_field(
-                        value,
-                        score_keys
-                    )
-                else:
-                    score_value = value
-
-                if isinstance(score_value, dict):
-                    score_value = score_value.get(
-                        "value",
-                        score_value.get("score")
-                    )
-
-                if score_value is None:
-                    continue
-
-                records.append({
-                    "date": date_value,
-                    "value": normalize_score(score_value)
-                })
-
-            except (
-                ValueError,
-                TypeError,
-                OverflowError
-            ):
-                continue
-
-        return records
-
-    raise ValueError(
-        f"A股贪恐指数 JSON 类型不支持：{type(raw).__name__}"
+    date_match = re.search(
+        r"(?m)^\s*-\s*日期\s*[:：]\s*(\d{4}-\d{2}-\d{2})",
+        markdown_text
     )
+    score_match = re.search(
+        r"(?m)^\s*-\s*指数\s*[:：]\s*([0-9]+(?:\.[0-9]+)?)\s*/\s*100",
+        markdown_text
+    )
+    if not score_match:
+        # 兼容少量格式差异
+        score_match = re.search(
+            r"(?m)^\s*-\s*(?:最终)?(?:恐惧贪婪)?指数\s*[:：]\s*"
+            r"([0-9]+(?:\.[0-9]+)?)\s*(?:分|/100)",
+            markdown_text
+        )
+    if not score_match:
+        raise ValueError("日报 Markdown 中未找到最终指数")
+
+    date_value = date_match.group(1) if date_match else fallback_date
+    if not date_value:
+        raise ValueError("日报 Markdown 中未找到指数日期")
+
+    return {
+        "date": normalize_date(date_value),
+        "value": normalize_score(score_match.group(1))
+    }
 
 
 def get_cn_data():
     """
-    A股：qjr1997/fear-greed-index 开源贪恐指数。
+    A股：kaifengmayao/a-share-fear-greed-index。
 
-    优先获取近期数据 data.json；
-    若无法获取或解析有效数据，则尝试 data_full.json。
-
-    成功后统一返回：
-        [
-            {"date": "YYYY-MM-DD", "value": 0～100},
-            ...
-        ]
-
-    仅当开源指数数据源不可用时，
-    才降级使用原有沪深300 RSI 计算。
+    从其 reports/YYYY-MM-DD.md 日报读取已计算好的最终指数。
+    先读取 latest.md，再从 GitHub 文件树中找最近的日期报告，
+    尽量补齐历史数据。报告只含一个当日分数时，仍能正常显示，
+    但历史统计只基于成功获取到的报告，不伪造历史分数。
     """
+    print("🇨🇳 正在获取 A股 AFGI 开源贪恐指数...")
+    records_by_date = {}
 
-    print("🇨🇳 正在获取 A股开源贪恐指数...")
+    # 1. 先获取 latest.md；若项目未更新 latest.md，后续会比较日期报告
+    try:
+        latest_text = request_text(CN_FG_LATEST_MD, timeout=20)
+        latest_record = parse_afgi_markdown(latest_text)
+        records_by_date[latest_record["date"]] = latest_record
+        print(
+            f"✅ 获取 AFGI latest.md：{latest_record['value']}，"
+            f"日期：{latest_record['date']}"
+        )
+    except Exception as e:
+        print(f"⚠️ AFGI latest.md 获取失败：{e}")
 
-    urls = [
-        (CN_FG_URL, "开源贪恐指数 data.json"),
-        (CN_FG_FULL_URL, "开源贪恐指数 data_full.json")
-    ]
+    # 2. 查询仓库文件树，找日期格式的日报文件
+    try:
+        tree_data = request_json(CN_FG_API_TREE, timeout=25)
+        tree = tree_data.get("tree", [])
+        date_files = []
+        for item in tree:
+            path = item.get("path", "")
+            match = re.fullmatch(r"reports/(\d{4}-\d{2}-\d{2})\.md", path)
+            if match:
+                date_files.append((match.group(1), path))
 
-    last_error = None
+        date_files.sort(key=lambda x: x[0], reverse=True)
 
-    for url, source_name in urls:
-        try:
-            print(f"🔄 正在请求：{url}")
+        # 只抓最近若干天的报告，最多并发 8 个请求，减少运行时间
+        candidates = date_files[:CN_HISTORY_LIMIT]
+        if candidates:
+            print(f"🔄 正在补齐 AFGI 历史报告，候选文件 {len(candidates)} 个...")
+            def fetch_report(item):
+                date_text, path = item
+                url = f"{CN_FG_RAW_BASE}/{path}"
+                text = request_text(url, timeout=20)
+                return parse_afgi_markdown(text, fallback_date=date_text)
 
-            raw = request_json(
-                url,
-                timeout=20
-            )
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = [pool.submit(fetch_report, item) for item in candidates]
+                for future in as_completed(futures):
+                    try:
+                        record = future.result()
+                        records_by_date[record["date"]] = record
+                    except Exception as e:
+                        print(f"⚠️ 一份 AFGI 历史日报解析失败：{e}")
 
-            records = extract_cn_fg_records(raw)
+    except Exception as e:
+        print(f"⚠️ AFGI 历史报告列表获取失败：{e}")
 
-            # 去重、排序
-            records = dedupe_by_date(records)
+    records = list(records_by_date.values())
+    records = dedupe_by_date(records)
+    records.sort(key=lambda x: x["date"], reverse=True)
 
-            records.sort(
-                key=lambda x: x["date"],
-                reverse=True
-            )
+    if records:
+        records = records[:CN_HISTORY_LIMIT]
+        latest = records[0]
+        print(
+            f"✅ A股 AFGI 获取成功：{latest['value']}，"
+            f"日期：{latest['date']}，有效记录：{len(records)} 条"
+        )
+        return records, "kaifengmayao A股 AFGI"
 
-            if not records:
-                raise ValueError(
-                    "JSON 中没有解析到有效日期和指数分数"
-                )
-
-            # 限制为最近 70 条记录，满足现有报告展示逻辑
-            records = records[:70]
-
-            latest = records[0]
-
-            print(
-                f"✅ A股开源贪恐指数获取成功："
-                f"{latest['value']}，"
-                f"日期：{latest['date']}，"
-                f"有效记录：{len(records)} 条"
-            )
-
-            return records, f"qjr1997 开源贪恐指数（{source_name}）"
-
-        except Exception as e:
-            last_error = e
-
-            print(
-                f"⚠️ {source_name} 获取或解析失败：{e}"
-            )
-
-    # 两个开源 JSON 均失败时，保留原有降级机制
-    print(
-        f"⚠️ A股开源贪恐指数不可用：{last_error}"
-    )
-
-    print("🔄 降级使用沪深300 RSI 历史数据...")
-
+    # 3. 开源项目不可用时，保留原脚本的沪深300 RSI 降级逻辑
+    print("⚠️ AFGI 开源报告不可用，降级尝试沪深300 RSI...")
     fallback_data = calculate_rsi_history("000300.SS")
-
     if fallback_data:
+        print("⚠️ 当前显示的是沪深300 RSI（降级），不是 AFGI 贪恐指数")
         return fallback_data, "沪深300 RSI（降级）"
 
-    print("❌ A股开源贪恐指数与 RSI 降级数据均获取失败")
-
+    print("❌ A股 AFGI 和 RSI 降级数据均获取失败")
     return None, "获取失败"
 
 
@@ -827,27 +457,16 @@ def get_cn_data():
 def calc_stats(data, period_type):
     if not data:
         return None
-
     current = data[0]
 
     def count(n):
         sub = data[:n]
-
-        low = sum(
-            1 for x in sub
-            if x["value"] < LIMIT_LOW
-        )
-
-        high = sum(
-            1 for x in sub
-            if x["value"] > LIMIT_HIGH
-        )
-
+        low = sum(1 for x in sub if x["value"] < LIMIT_LOW)
+        high = sum(1 for x in sub if x["value"] > LIMIT_HIGH)
         return low, high
 
     l30, h30 = count(30)
     l60, h60 = count(60)
-
     return {
         "date": current["date"],
         "val": current["value"],
@@ -864,44 +483,24 @@ def calc_stats(data, period_type):
 def make_svg_chart(history):
     if not history:
         return "<p class='muted'>暂无趋势图数据</p>"
-
     data = list(reversed(history[:30]))
-
     w, h = 360, 130
-
     left, right, top, bottom = 28, 8, 10, 20
-
-    pw = w - left - right
-    ph = h - top - bottom
+    pw, ph = w - left - right, h - top - bottom
 
     def x_pos(i):
-        return (
-            left +
-            (
-                pw / (len(data) - 1) * i
-                if len(data) > 1
-                else pw / 2
-            )
-        )
+        return left + (pw / (len(data) - 1) * i if len(data) > 1 else pw / 2)
 
     def y_pos(v):
         v = max(0, min(100, float(v)))
-
         return top + (100 - v) / 100 * ph
 
-    pts = []
-
-    for i, item in enumerate(data):
-        pts.append(
-            f"{x_pos(i):.1f},{y_pos(item['value']):.1f}"
-        )
-
-    y25 = y_pos(25)
-    y75 = y_pos(75)
-
-    start = data[0]["date"][5:]
-    end = data[-1]["date"][5:]
-
+    pts = [
+        f"{x_pos(i):.1f},{y_pos(item['value']):.1f}"
+        for i, item in enumerate(data)
+    ]
+    y25, y75 = y_pos(25), y_pos(75)
+    start, end = data[0]["date"][5:], data[-1]["date"][5:]
     return f"""
     <svg viewBox='0 0 {w} {h}' width='100%' xmlns='http://www.w3.org/2000/svg'>
       <rect x='0' y='0' width='{w}' height='{h}' rx='8' fill='#fff'/>
@@ -921,29 +520,18 @@ def make_svg_chart(history):
 def make_history_table(history, period_type, compact=False):
     if not history:
         return "<p class='muted'>暂无明细数据</p>"
-
     data = history[:30]
-
     if compact:
-        pairs = " ｜ ".join([
-            f"{x['date'][5:]}:{x['value']}"
-            for x in data
-        ])
-
+        pairs = " ｜ ".join([f"{x['date'][5:]}:{x['value']}" for x in data])
         return f"<p class='seq'>{safe(pairs)}</p>"
-
     rows = []
-
     for x in data:
-        cls = status_class(x["value"])
-        st = status_style(x["value"])
-
+        cls, st = status_class(x["value"]), status_style(x["value"])
         rows.append(
             f"<tr><td>{safe(x['date'])}</td>"
             f"<td class='{cls}' style='{st}'>{x['value']}</td>"
             f"<td class='{cls}' style='{st}'>{safe(status_text(x['value']))}</td></tr>"
         )
-
     return f"""
     <table class='hist'>
       <tr><th>日期</th><th>指数</th><th>状态</th></tr>
@@ -955,18 +543,9 @@ def make_history_table(history, period_type, compact=False):
 
 def make_card(name, source, stats, history, link=None, compact=False):
     if not stats:
-        return (
-            f"<div class='card err'>"
-            f"❌ {safe(name)} 数据获取失败"
-            f"</div>"
-        )
-
-    v = stats["val"]
-    c = value_color(v)
-    pt = stats["period_type"]
-
+        return f"<div class='card err'>❌ {safe(name)} 数据获取失败</div>"
+    v, c, pt = stats["val"], value_color(stats["val"]), stats["period_type"]
     warn = ""
-
     if stats["h30"] >= DANGER_DAYS_THRESHOLD:
         warn = (
             f"<div class='warn'>⚠️ "
@@ -975,15 +554,10 @@ def make_card(name, source, stats, history, link=None, compact=False):
             f"<span class='greed' style='color:{GREED_COLOR};font-weight:800'>{stats['h30']}</span>"
             f" 次极度贪婪。</div>"
         )
-
-    link_html = ""
-
-    if link:
-        link_html = (
-            f"<p><a class='btn' href='{safe(link)}'>"
-            f"查看详细走势</a></p>"
-        )
-
+    link_html = (
+        f"<p><a class='btn' href='{safe(link)}'>查看详细走势</a></p>"
+        if link else ""
+    )
     return f"""
     <div class='card'>
       <div class='top'>
@@ -1009,16 +583,11 @@ def make_card(name, source, stats, history, link=None, compact=False):
 def build_html(results, beijing_time_str, compact=False):
     cards = "".join(
         make_card(
-            r["name"],
-            r["source"],
-            r["stats"],
-            r["history"],
-            r.get("link"),
-            compact=compact
+            r["name"], r["source"], r["stats"], r["history"],
+            r.get("link"), compact=compact
         )
         for r in results
     )
-
     return f"""
     <html>
     <head>
@@ -1052,13 +621,10 @@ def build_html(results, beijing_time_str, compact=False):
 def send_push(title, content):
     token = os.getenv("PUSHPLUS_TOKEN")
     topic = os.getenv("PUSHPLUS_TOPIC")
-
     if not token:
         print("❌ 未检测到 PUSHPLUS_TOKEN，跳过推送")
         return False
-
     url = "http://www.pushplus.plus/send"
-
     payload = {
         "token": token,
         "title": title,
@@ -1066,139 +632,76 @@ def send_push(title, content):
         "template": "html",
         "channel": "wechat"
     }
-
     if topic:
         payload["topic"] = topic
-
     try:
-        res = requests.post(
-            url,
-            json=payload,
-            timeout=20
-        )
-
+        res = requests.post(url, json=payload, timeout=20)
         result = res.json()
-
         if result.get("code") == 200:
             print("✅ 推送成功")
             return True
-
         print(f"❌ 推送失败：{result}")
-
         return False
-
     except Exception as e:
         print(f"❌ 网络异常，推送失败: {e}")
-
         return False
 
 
 # ================= 主程序 =================
 def main():
     print("🚀 开始分析全球市场情绪...")
-
     tasks = [
         {
-            "name": "US 美股",
-            "getter": get_us_data,
-            "ticker": None,
-            "period_type": "交易日",
-            "link": None
+            "name": "US 美股", "getter": get_us_data,
+            "ticker": None, "period_type": "交易日", "link": None
         },
         {
-            "name": "₿ 比特币",
-            "getter": get_crypto_data,
-            "ticker": None,
-            "period_type": "自然日",
-            "link": None
+            "name": "₿ 比特币", "getter": get_crypto_data,
+            "ticker": None, "period_type": "自然日", "link": None
         },
         {
-            "name": "CN A股",
-            "getter": get_cn_data,
-            "ticker": None,
-            "period_type": "交易日",
-            "link": JIUQUAN_URL
+            "name": "CN A股", "getter": get_cn_data,
+            "ticker": None, "period_type": "交易日", "link": JIUQUAN_URL
         },
     ]
 
-    results = []
-    title_parts = []
-
+    results, title_parts = [], []
     for task in tasks:
         raw_data, source = task["getter"]()
-
-        stats = calc_stats(
-            raw_data,
-            task["period_type"]
-        )
-
+        stats = calc_stats(raw_data, task["period_type"])
         results.append({
-            "name": task["name"],
-            "source": source,
-            "stats": stats,
-            "history": raw_data or [],
-            "link": task["link"]
+            "name": task["name"], "source": source, "stats": stats,
+            "history": raw_data or [], "link": task["link"]
         })
-
         if stats:
-            title_parts.append(
-                f"{task['name'].split()[-1]}:{stats['val']}"
-            )
+            title_parts.append(f"{task['name'].split()[-1]}:{stats['val']}")
 
-    beijing_time = (
-        datetime.now(timezone.utc) +
-        timedelta(hours=8)
-    )
-
-    beijing_time_str = (
-        beijing_time.strftime("%Y-%m-%d %H:%M") +
-        "（北京时间）"
-    )
-
-    html_content = build_html(
-        results,
-        beijing_time_str,
-        compact=False
-    )
+    beijing_time = datetime.now(timezone.utc) + timedelta(hours=8)
+    beijing_time_str = beijing_time.strftime("%Y-%m-%d %H:%M") + "（北京时间）"
+    html_content = build_html(results, beijing_time_str, compact=False)
 
     if len(html_content) > MAX_PUSHPLUS_LEN:
-        html_content = build_html(
-            results,
-            beijing_time_str,
-            compact=True
-        )
+        html_content = build_html(results, beijing_time_str, compact=True)
 
     if len(html_content) > MAX_PUSHPLUS_LEN:
         summary_lines = []
-
         for r in results:
             s = r["stats"]
-
             if s:
                 summary_lines.append(
                     f"{r['name']}：{s['val']}，{s['status']}，"
-                    f"近30个{s['period_type']}恐慌{s['l30']}次，"
-                    f"贪婪{s['h30']}次"
+                    f"近30个{s['period_type']}恐慌{s['l30']}次，贪婪{s['h30']}次"
                 )
             else:
-                summary_lines.append(
-                    f"{r['name']}：数据获取失败"
-                )
-
+                summary_lines.append(f"{r['name']}：数据获取失败")
         html_content = (
-            "<br>".join(summary_lines) +
-            f"<br><br>更新时间：{safe(beijing_time_str)}"
+            "<br>".join(summary_lines)
+            + f"<br><br>更新时间：{safe(beijing_time_str)}"
         )
 
     if title_parts:
-        title = (
-            beijing_time.strftime("%m-%d") +
-            " | " +
-            " | ".join(title_parts)
-        )
-
+        title = beijing_time.strftime("%m-%d") + " | " + " | ".join(title_parts)
         send_push(title, html_content)
-
     else:
         print("❌ 所有数据获取失败")
 
