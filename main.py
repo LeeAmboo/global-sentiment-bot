@@ -1545,7 +1545,7 @@ def make_card(name, source, stats, history, link=None, compact=False):
     if link:
         link_html = (
             f"<p><a class='btn' href='{safe(link)}'>"
-            f"查看详细走势</a></p>"
+            f"查看韭圈儿走势</a></p>"
         )
 
     return f"""
