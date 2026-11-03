@@ -1,5 +1,21 @@
 [
   {
+    "date": "2026-11-02",
+    "value": 37,
+    "model": "five_factor_v1",
+    "factor_count": 3,
+    "factors": {
+      "RSI": 29.26,
+      "趋势": 0.4,
+      "市场宽度": 73.34
+    },
+    "weights": {
+      "RSI": 0.307692,
+      "趋势": 0.307692,
+      "市场宽度": 0.384615
+    }
+  },
+  {
     "date": "2026-10-30",
     "value": 29,
     "model": "five_factor_v1",
