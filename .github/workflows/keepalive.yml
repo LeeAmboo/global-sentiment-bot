@@ -27,16 +27,19 @@ jobs:
           mkdir -p .github
           date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/keepalive.txt
 
+
       - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          if git diff --quiet; then
+          # 先暂存文件，再检查是否存在变化
+          git add .github/keepalive.txt
+
+          if git diff --cached --quiet; then
             echo "No changes."
             exit 0
           fi
 
-          git add .github/keepalive.txt
           git commit -m "chore: keepalive"
           git push
