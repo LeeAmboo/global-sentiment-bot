@@ -1804,15 +1804,17 @@ def main():
         )
 
     if title_parts:
-        title = (
-            beijing_time.strftime("%m-%d")
-            + " | "
-            + " | ".join(title_parts)
-        )
+    title = (
+        beijing_time.strftime("%m-%d")
+        + " | "
+        + " | ".join(title_parts)
+    )
 
-        send_push(title, html_content)
-    else:
-        print("❌ 所有数据获取失败")
+    if not send_push(title, html_content):
+        raise RuntimeError("PushPlus 推送失败，请检查接口和配置")
+else:
+    print("❌ 所有数据获取失败")
+    raise RuntimeError("所有数据获取失败，无法生成推送内容")
 
 
 if __name__ == "__main__":
