@@ -1,11 +1,7 @@
 name: Global Sentiment Monitor
-
 on:
-  # 定时触发：北京时间每天 06:38（UTC 22:38）
   schedule:
-    - cron: '04 04 * * *'
-    
-  # 手动触发：允许在 Actions 页面点击 Run workflow
+    - cron: "29 22 * * *"
   workflow_dispatch:
 
 # 允许 GITHUB_TOKEN 读取和写入仓库内容
