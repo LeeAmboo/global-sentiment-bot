@@ -1,7 +1,7 @@
 name: Global Sentiment Monitor
 on:
   schedule:
-    - cron: "29 22 * * *"
+    - cron: "28 22 * * *"
   workflow_dispatch:
 
 # 允许 GITHUB_TOKEN 读取和写入仓库内容
