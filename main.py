@@ -659,14 +659,7 @@ def _save_cn_five_factor_history(records, sha, url, branch, path):
 
 # ================= 融资买入额：已修复 =================
 def _fetch_margin_buy_amount(trade_date):
-    """
-    获取指定交易日沪深两市融资买入额。
-
-    上交所 stock_margin_sse 使用 start_date/end_date；
-    深交所 stock_margin_szse 使用 date。
-
-    任一交易所获取失败时返回 None，不拼接不完整的两市数据。
-    """
+    """ 获取指定交易日沪深两市融资买入额。 上交所 stock_margin_sse 使用 start_date/end_date； 深交所 stock_margin_szse 使用 date。 任一交易所获取失败时返回 None，不拼接不完整的两市数据。 """
     target_date = pd.Timestamp(trade_date).normalize()
     date_str = target_date.strftime("%Y%m%d")
     values = []
@@ -807,13 +800,7 @@ def _fetch_margin_buy_amount(trade_date):
 
 # ================= A股五因子模型 =================
 def get_cn_data():
-    """
-    A股五因子情绪模型：
-    RSI 20% + 125日趋势分位数 20% + 成交活跃度 20%
-    + 市场宽度 25% + 融资买入额占成交额比例 15%。
-
-    缺失因子不填 0，按有效因子的原始权重重新归一化。
-    """
+    """ A股五因子情绪模型： RSI 20% + 125日趋势分位数 20% + 成交活跃度 20% + 市场宽度 25% + 融资买入额占成交额比例 15%。 缺失因子不填 0，按有效因子的原始权重重新归一化。 """
     try:
         # ---------- 因子1、2：沪深300价格动能与长期趋势 ----------
         hs300 = ak.stock_zh_index_daily(symbol="sh000300")
@@ -1456,33 +1443,7 @@ def make_svg_chart(history):
     start = data[0]["date"][5:]
     end = data[-1]["date"][5:]
 
-    return f"""
-    <svg viewBox='0 0 {w} {h}' width='100%'
-         xmlns='http://www.w3.org/2000/svg'>
-      <rect x='0' y='0' width='{w}' height='{h}'
-            rx='8' fill='#fff'/>
-      <line x1='{left}' y1='{top}' x2='{left}' y2='{h-bottom}'
-            stroke='#ddd'/>
-      <line x1='{left}' y1='{h-bottom}' x2='{w-right}'
-            y2='{h-bottom}' stroke='#ddd'/>
-      <line x1='{left}' y1='{y75:.1f}' x2='{w-right}'
-            y2='{y75:.1f}' stroke='{GREED_COLOR}'
-            stroke-dasharray='4 4'/>
-      <line x1='{left}' y1='{y25:.1f}' x2='{w-right}'
-            y2='{y25:.1f}' stroke='{FEAR_COLOR}'
-            stroke-dasharray='4 4'/>
-      <text x='4' y='{y75+3:.1f}' font-size='9'
-            fill='#999'>75</text>
-      <text x='4' y='{y25+3:.1f}' font-size='9'
-            fill='#999'>25</text>
-      <polyline points='{' '.join(pts)}' fill='none'
-                stroke='#2563eb' stroke-width='2.2'/>
-      <text x='{left}' y='{h-5}' font-size='9'
-            fill='#999'>{safe(start)}</text>
-      <text x='{w-right}' y='{h-5}' text-anchor='end'
-            font-size='9' fill='#999'>{safe(end)}</text>
-    </svg>
-    """
+    return f""" <svg viewBox='0 0 {w} {h}' width='100%' xmlns='http://www.w3.org/2000/svg'> <rect x='0' y='0' width='{w}' height='{h}' rx='8' fill='#fff'/> <line x1='{left}' y1='{top}' x2='{left}' y2='{h-bottom}' stroke='#ddd'/> <line x1='{left}' y1='{h-bottom}' x2='{w-right}' y2='{h-bottom}' stroke='#ddd'/> <line x1='{left}' y1='{y75:.1f}' x2='{w-right}' y2='{y75:.1f}' stroke='{GREED_COLOR}' stroke-dasharray='4 4'/> <line x1='{left}' y1='{y25:.1f}' x2='{w-right}' y2='{y25:.1f}' stroke='{FEAR_COLOR}' stroke-dasharray='4 4'/> <text x='4' y='{y75+3:.1f}' font-size='9' fill='#999'>75</text> <text x='4' y='{y25+3:.1f}' font-size='9' fill='#999'>25</text> <polyline points='{' '.join(pts)}' fill='none' stroke='#2563eb' stroke-width='2.2'/> <text x='{left}' y='{h-5}' font-size='9' fill='#999'>{safe(start)}</text> <text x='{w-right}' y='{h-5}' text-anchor='end' font-size='9' fill='#999'>{safe(end)}</text> </svg> """
 
 
 def make_history_table(history, period_type, compact=False):
@@ -1510,13 +1471,7 @@ def make_history_table(history, period_type, compact=False):
             f"{safe(status_text(x['value']))}</td></tr>"
         )
 
-    return f"""
-    <table class='hist'>
-      <tr><th>日期</th><th>指数</th><th>状态</th></tr>
-      {''.join(rows)}
-    </table>
-    <p class='note'>股票类为近30个{safe(period_type)}；比特币为近30个自然日。</p>
-    """
+    return f""" <table class='hist'> <tr><th>日期</th><th>指数</th><th>状态</th></tr> {''.join(rows)} </table> <p class='note'>股票类为近30个{safe(period_type)}；比特币为近30个自然日。</p> """
 
 
 def make_card(name, source, stats, history, link=None, compact=False):
@@ -1548,55 +1503,7 @@ def make_card(name, source, stats, history, link=None, compact=False):
             f"查看韭圈儿走势</a></p>"
         )
 
-    return f"""
-    <div class='card'>
-      <div class='top'>
-        <div>
-          <b>{safe(name)}</b><br>
-          <span>{safe(stats['date'])}｜{safe(source)}</span>
-        </div>
-        <div class='num' style='color:{c}'>
-          {v}<br><small>{safe(stats['status'])}</small>
-        </div>
-      </div>
-      <table class='sum'>
-        <tr>
-          <th>周期</th>
-          <th class='fear' style='color:{FEAR_COLOR};font-weight:800'>
-            恐慌&lt;{LIMIT_LOW}
-          </th>
-          <th class='greed' style='color:{GREED_COLOR};font-weight:800'>
-            贪婪&gt;{LIMIT_HIGH}
-          </th>
-        </tr>
-        <tr>
-          <td>近30个{safe(pt)}</td>
-          <td class='fear' style='color:{FEAR_COLOR};font-weight:800'>
-            {stats['l30']}
-          </td>
-          <td class='greed' style='color:{GREED_COLOR};font-weight:800'>
-            {stats['h30']}
-          </td>
-        </tr>
-        <tr>
-          <td>近60个{safe(pt)}</td>
-          <td class='fear' style='color:{FEAR_COLOR};font-weight:800'>
-            {stats['l60']}
-          </td>
-          <td class='greed' style='color:{GREED_COLOR};font-weight:800'>
-            {stats['h60']}
-          </td>
-        </tr>
-      </table>
-      {warn}
-      <details>
-        <summary>📈 查看近30个{safe(pt)}趋势图</summary>
-        <div class='chart'>{make_svg_chart(history)}</div>
-        {make_history_table(history, pt, compact=compact)}
-      </details>
-      {link_html}
-    </div>
-    """
+    return f""" <div class='card'> <div class='top'> <div> <b>{safe(name)}</b><br> <span>{safe(stats['date'])}｜{safe(source)}</span> </div> <div class='num' style='color:{c}'> {v}<br><small>{safe(stats['status'])}</small> </div> </div> <table class='sum'> <tr> <th>周期</th> <th class='fear' style='color:{FEAR_COLOR};font-weight:800'> 恐慌&lt;{LIMIT_LOW} </th> <th class='greed' style='color:{GREED_COLOR};font-weight:800'> 贪婪&gt;{LIMIT_HIGH} </th> </tr> <tr> <td>近30个{safe(pt)}</td> <td class='fear' style='color:{FEAR_COLOR};font-weight:800'> {stats['l30']} </td> <td class='greed' style='color:{GREED_COLOR};font-weight:800'> {stats['h30']} </td> </tr> <tr> <td>近60个{safe(pt)}</td> <td class='fear' style='color:{FEAR_COLOR};font-weight:800'> {stats['l60']} </td> <td class='greed' style='color:{GREED_COLOR};font-weight:800'> {stats['h60']} </td> </tr> </table> {warn} <details> <summary>📈 查看近30个{safe(pt)}趋势图</summary> <div class='chart'>{make_svg_chart(history)}</div> {make_history_table(history, pt, compact=compact)} </details> {link_html} </div> """
 
 
 def build_html(results, beijing_time_str, compact=False):
@@ -1612,62 +1519,7 @@ def build_html(results, beijing_time_str, compact=False):
         for r in results
     )
 
-    return f"""
-    <html>
-    <head>
-      <meta charset='utf-8'>
-      <style>
-        body{{margin:0;background:#f4f6f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#333}}
-        .wrap{{max-width:620px;margin:0 auto;padding:12px}}
-        h3{{text-align:center;margin:12px 0 16px}}
-        .card{{background:#fff;border:1px solid #eee;border-radius:12px;padding:14px;margin:0 0 14px;box-shadow:0 2px 8px rgba(0,0,0,.04)}}
-        .top{{display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid #eee;padding-bottom:9px;margin-bottom:9px}}
-        .top span{{font-size:11px;color:#999}}
-        .num{{font-size:28px;font-weight:800;text-align:right;line-height:1}}
-        .num small{{font-size:11px}}
-        table{{width:100%;border-collapse:collapse;text-align:center}}
-        th,td{{padding:6px;border-bottom:1px solid #eee;font-size:12px}}
-        th{{background:#f8fafc}}
-        .sum{{background:#fafafa}}
-        .hist{{margin-top:8px}}
-        .fear{{color:{FEAR_COLOR}!important;font-weight:800}}
-        .greed{{color:{GREED_COLOR}!important;font-weight:800}}
-        .neutral{{color:{NEUTRAL_COLOR};font-weight:600}}
-        .warn{{background:#fff1f2;color:#991b1b;border:1px solid #fecdd3;border-radius:6px;padding:8px;margin-top:8px;font-size:12px}}
-        summary{{cursor:pointer;text-align:center;margin-top:10px;padding:8px;border:1px solid #bfdbfe;background:#eff6ff;color:#075985;border-radius:6px;font-size:13px;font-weight:700}}
-        .chart{{margin-top:8px;border:1px solid #eee;border-radius:8px;overflow:hidden;background:#fff}}
-        .btn{{display:block;text-align:center;background:#e7f5ff;color:#075985;text-decoration:none;border:1px solid #bfdbfe;border-radius:6px;padding:8px;font-weight:700;font-size:13px}}
-        .foot{{background:#e9ecef;border-left:4px solid #2563eb;border-radius:8px;padding:12px;font-size:12px;line-height:1.7}}
-        .note,.muted{{font-size:11px;color:#999;text-align:right}}
-        .seq{{font-size:12px;line-height:1.8;color:#555}}
-        .err{{background:#fee2e2}}
-      </style>
-    </head>
-    <body>
-      <div class='wrap'>
-        <h3>🌍 全球核心资产情绪监控</h3>
-        {cards}
-        <div class='foot'>
-          <b>📊 策略提示</b><br>
-          <span class='fear' style='color:{FEAR_COLOR};font-weight:800'>
-            🟢 恐慌机会：指数 &lt; {LIMIT_LOW}，关注定投。
-          </span><br>
-          <span class='greed' style='color:{GREED_COLOR};font-weight:800'>
-            🔴 贪婪风险：指数 &gt; {LIMIT_HIGH}，关注止盈。
-          </span><br>
-          ⚠️ 近30天
-          <span class='greed' style='color:{GREED_COLOR};font-weight:800'>
-            极度贪婪
-          </span>
-          ≥ {DANGER_DAYS_THRESHOLD} 次：注意高位。<br>
-          <span style='color:#999'>
-            Data Updated: {safe(beijing_time_str)}
-          </span>
-        </div>
-      </div>
-    </body>
-    </html>
-    """
+    return f""" <html> <head> <meta charset='utf-8'> <style> body{{margin:0;background:#f4f6f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#333}} .wrap{{max-width:620px;margin:0 auto;padding:12px}} h3{{text-align:center;margin:12px 0 16px}} .card{{background:#fff;border:1px solid #eee;border-radius:12px;padding:14px;margin:0 0 14px;box-shadow:0 2px 8px rgba(0,0,0,.04)}} .top{{display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid #eee;padding-bottom:9px;margin-bottom:9px}} .top span{{font-size:11px;color:#999}} .num{{font-size:28px;font-weight:800;text-align:right;line-height:1}} .num small{{font-size:11px}} table{{width:100%;border-collapse:collapse;text-align:center}} th,td{{padding:6px;border-bottom:1px solid #eee;font-size:12px}} th{{background:#f8fafc}} .sum{{background:#fafafa}} .hist{{margin-top:8px}} .fear{{color:{FEAR_COLOR}!important;font-weight:800}} .greed{{color:{GREED_COLOR}!important;font-weight:800}} .neutral{{color:{NEUTRAL_COLOR};font-weight:600}} .warn{{background:#fff1f2;color:#991b1b;border:1px solid #fecdd3;border-radius:6px;padding:8px;margin-top:8px;font-size:12px}} summary{{cursor:pointer;text-align:center;margin-top:10px;padding:8px;border:1px solid #bfdbfe;background:#eff6ff;color:#075985;border-radius:6px;font-size:13px;font-weight:700}} .chart{{margin-top:8px;border:1px solid #eee;border-radius:8px;overflow:hidden;background:#fff}} .btn{{display:block;text-align:center;background:#e7f5ff;color:#075985;text-decoration:none;border:1px solid #bfdbfe;border-radius:6px;padding:8px;font-weight:700;font-size:13px}} .foot{{background:#e9ecef;border-left:4px solid #2563eb;border-radius:8px;padding:12px;font-size:12px;line-height:1.7}} .note,.muted{{font-size:11px;color:#999;text-align:right}} .seq{{font-size:12px;line-height:1.8;color:#555}} .err{{background:#fee2e2}} </style> </head> <body> <div class='wrap'> <h3>🌍 全球核心资产情绪监控</h3> {cards} <div class='foot'> <b>📊 策略提示</b><br> <span class='fear' style='color:{FEAR_COLOR};font-weight:800'> 🟢 恐慌机会：指数 &lt; {LIMIT_LOW}，关注定投。 </span><br> <span class='greed' style='color:{GREED_COLOR};font-weight:800'> 🔴 贪婪风险：指数 &gt; {LIMIT_HIGH}，关注止盈。 </span><br> ⚠️ 近30天 <span class='greed' style='color:{GREED_COLOR};font-weight:800'> 极度贪婪 </span> ≥ {DANGER_DAYS_THRESHOLD} 次：注意高位。<br> <span style='color:#999'> Data Updated: {safe(beijing_time_str)} </span> </div> </div> </body> </html> """
 
 
 # ================= PushPlus 推送 =================
@@ -1803,19 +1655,19 @@ def main():
             + f"<br><br>更新时间：{safe(beijing_time_str)}"
         )
 
-if title_parts:
-    title = (
-        beijing_time.strftime("%m-%d")
-        + " | "
-        + " | ".join(title_parts)
-    )
+    if title_parts:
+        title = (
+            beijing_time.strftime("%m-%d")
+            + " | "
+            + " | ".join(title_parts)
+        )
 
-    if not send_push(title, html_content):
-        raise RuntimeError("PushPlus 推送失败，请检查接口和配置")
+        if not send_push(title, html_content):
+            raise RuntimeError("PushPlus 推送失败，请检查接口和配置")
 
-else:
-    print("❌ 所有数据获取失败")
-    raise RuntimeError("所有数据获取失败，无法生成推送内容")
+    else:
+        print("❌ 所有数据获取失败")
+        raise RuntimeError("所有数据获取失败，无法生成推送内容")
 
 
 if __name__ == "__main__":
