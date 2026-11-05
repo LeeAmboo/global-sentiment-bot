@@ -3,7 +3,7 @@ name: Keepalive
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 0 * * 1"
+    - cron: "16 0 * * 1"
 
 permissions:
   contents: write
