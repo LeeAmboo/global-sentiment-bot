@@ -1803,7 +1803,7 @@ def main():
             + f"<br><br>更新时间：{safe(beijing_time_str)}"
         )
 
-    if title_parts:
+if title_parts:
     title = (
         beijing_time.strftime("%m-%d")
         + " | "
@@ -1812,6 +1812,7 @@ def main():
 
     if not send_push(title, html_content):
         raise RuntimeError("PushPlus 推送失败，请检查接口和配置")
+
 else:
     print("❌ 所有数据获取失败")
     raise RuntimeError("所有数据获取失败，无法生成推送内容")
