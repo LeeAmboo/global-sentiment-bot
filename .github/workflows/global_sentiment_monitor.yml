@@ -3,7 +3,7 @@ name: Global Sentiment Monitor
 on:
   # 定时触发：北京时间每天 06:30（UTC 22:30）
   schedule:
-    - cron: '30 22 * * *'
+    - cron: '07 02 * * *'
 
   # 手动触发：允许在 Actions 页面点击 Run workflow
   workflow_dispatch:
